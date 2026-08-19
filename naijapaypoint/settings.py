@@ -68,10 +68,11 @@ DEFAULT_FROM_EMAIL = config(
 )
 
 ALLOWED_HOSTS = [
+    "naijapaypointbackend-production.up.railway.app",
     "naijapaypoint-backend-production.up.railway.app",
-    "localhost", 
-    "127.0.0.1", 
-    "10.0.0.7",  
+    "localhost",
+    "127.0.0.1",
+    "10.0.0.7",
     ".vercel.app",
 ]
 
