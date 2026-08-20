@@ -110,6 +110,12 @@ class ElectricityPurchaseView(APIView):
             phone="08000000000",
         )
 
+        print(
+            "VTPASS ELECTRICITY PURCHASE RESPONSE:",
+            provider_response,
+            flush=True,
+        )
+
         is_successful = (
             provider_response.get("code") == "000"
             or provider_response.get("response_description", "").lower() == "transaction successful"
