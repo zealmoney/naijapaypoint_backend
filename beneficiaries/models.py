@@ -33,6 +33,15 @@ class Beneficiary(models.Model):
         blank=True,
     )
 
+    meter_type = models.CharField(
+        max_length=20,
+        blank=True,
+        choices=(
+            ("prepaid", "Prepaid"),
+            ("postpaid", "Postpaid"),
+        ),
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
