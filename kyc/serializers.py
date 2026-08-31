@@ -271,6 +271,57 @@ class KYCUpdateSerializer(serializers.ModelSerializer):
 
         if instance:
             KYCService.ensure_editable(instance)
+        
+        identity_method = attrs.get(
+            "identity_verification_method",
+            getattr(instance, "identity_verification_method", ""),
+        )
+
+        identity_value = attrs.get(
+            "identity_verification_value",
+            getattr(instance, "identity_verification_value", ""),
+        )
+
+        if identity_value:
+            identity_value = str(identity_value).strip()
+
+            if identity_method == KYCVerification.IdentityVerificationMethod.BVN:
+                if not identity_value.isdigit() or len(identity_value) != 11:
+                    raise serializers.ValidationError(
+                        {
+                            "identity_verification_value": (
+                                "BVN must be exactly 11 digits."
+                            )
+                        }
+                    )
+
+            elif (
+                identity_method
+                == KYCVerification.IdentityVerificationMethod.PHONE_NUMBER
+            ):
+                cleaned_phone = (
+                    identity_value
+                    .replace(" ", "")
+                    .replace("-", "")
+                    .replace("(", "")
+                    .replace(")", "")
+                )
+
+                if cleaned_phone.startswith("+"):
+                    digits = cleaned_phone[1:]
+                else:
+                    digits = cleaned_phone
+
+                if not digits.isdigit() or len(digits) < 10 or len(digits) > 15:
+                    raise serializers.ValidationError(
+                        {
+                            "identity_verification_value": (
+                                "Enter a valid phone number."
+                            )
+                        }
+                    )
+
+                attrs["identity_verification_value"] = cleaned_phone
 
         document_type = attrs.get(
             "document_type",

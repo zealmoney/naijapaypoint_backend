@@ -34,9 +34,127 @@ from urllib.parse import urlencode
 
 from transactions.models import Transaction
 
+from django.db.models import Sum
+
 logger = logging.getLogger(__name__)
 
-REFERRAL_BONUS_AMOUNT = 100  # ₦100 per successful referral
+REFERRAL_BONUS_AMOUNT = Decimal("100.00")
+REFERRAL_FUNDING_THRESHOLD = Decimal("5000.00")
+
+def award_referral_bonus_if_eligible(user):
+    """
+    Award the referral bonus once the referred user has
+    cumulatively funded at least ₦5,000 through successful
+    wallet-funding payments.
+
+    Spending from the wallet does not reduce referral progress.
+    """
+
+    referral = (
+        Referral.objects
+        .select_for_update()
+        .select_related("referrer")
+        .filter(
+            referred_user=user,
+            bonus_paid=False,
+        )
+        .first()
+    )
+
+    if not referral:
+        return False
+
+    total_successful_funding = (
+        PaymentTransaction.objects
+        .filter(
+            user=user,
+            status="success",
+        )
+        .aggregate(
+            total=Sum("amount")
+        )["total"]
+        or Decimal("0.00")
+    )
+
+    if (
+        total_successful_funding
+        < REFERRAL_FUNDING_THRESHOLD
+    ):
+        return False
+
+    referrer_wallet = (
+        referral.referrer.wallet
+    )
+
+    bonus_reference = (
+        f"REF-BONUS-{referral.id}"
+    )
+
+    WalletService.credit_wallet(
+        wallet=referrer_wallet,
+        amount=REFERRAL_BONUS_AMOUNT,
+        reference=bonus_reference,
+        description=(
+            "Referral bonus for inviting "
+            f"{user.email}"
+        ),
+    )
+
+    referral.bonus_paid = True
+    referral.bonus_amount = (
+        REFERRAL_BONUS_AMOUNT
+    )
+
+    referral.save(
+        update_fields=[
+            "bonus_paid",
+            "bonus_amount",
+        ]
+    )
+
+    referral_profile, _ = (
+        ReferralProfile.objects
+        .get_or_create(
+            user=referral.referrer
+        )
+    )
+
+    referral_profile.total_bonus_earned += (
+        REFERRAL_BONUS_AMOUNT
+    )
+
+    referral_profile.save(
+        update_fields=[
+            "total_bonus_earned"
+        ]
+    )
+
+    NotificationService.create_notification(
+        user=referral.referrer,
+        notification_type="wallet",
+        title="Referral Bonus Earned",
+        message=(
+            f"You earned "
+            f"₦{REFERRAL_BONUS_AMOUNT} "
+            f"for inviting {user.email}."
+        ),
+        metadata={
+            "reference":
+                bonus_reference,
+            "referred_user":
+                user.email,
+            "amount":
+                str(
+                    REFERRAL_BONUS_AMOUNT
+                ),
+            "qualification_amount":
+                str(
+                    total_successful_funding
+                ),
+        },
+    )
+
+    return True
 
 def ensure_wallet_funding_transaction(payment, user):
     transaction, created = Transaction.objects.get_or_create(
@@ -168,8 +286,15 @@ class VerifyPaymentView(APIView):
                 request.user,
             )
 
+            with transaction.atomic():
+                award_referral_bonus_if_eligible(
+                    request.user
+                )
+
             return Response(
-                PaymentTransactionSerializer(payment).data
+                PaymentTransactionSerializer(
+                    payment
+                ).data
             )
 
         paystack_response = PaystackService.verify_transaction(reference)
@@ -216,6 +341,10 @@ class VerifyPaymentView(APIView):
                     request.user,
                 )
 
+                award_referral_bonus_if_eligible(
+                    request.user
+                )
+
                 return Response(
                     PaymentTransactionSerializer(payment).data
                 )
@@ -230,24 +359,6 @@ class VerifyPaymentView(APIView):
             ensure_wallet_funding_transaction(
                 payment,
                 request.user,
-            )
-
-            Transaction.objects.get_or_create(
-                reference=payment.reference,
-                defaults={
-                    "user": request.user,
-                    "service_type": "wallet_funding",
-                    "amount": payment.amount,
-                    "status": "success",
-                    "provider": "paystack",
-                    "provider_reference": payment.reference,
-                    "description": "Wallet funding via Paystack",
-                    "metadata": {
-                        "payment_transaction_id": payment.id,
-                        "payment_method": "paystack",
-                        "source": "wallet_funding",
-                    },
-                },
             )
 
             payment.status = "success"
@@ -266,45 +377,9 @@ class VerifyPaymentView(APIView):
                 amount=payment.amount,
             )
 
-            referral = Referral.objects.filter(
-                referred_user=request.user,
-                bonus_paid=False,
-            ).first()
-
-            if referral:
-                referrer_wallet = referral.referrer.wallet
-
-                bonus_reference = f"REF-BONUS-{payment.reference}"
-
-                WalletService.credit_wallet(
-                    wallet=referrer_wallet,
-                    amount=REFERRAL_BONUS_AMOUNT,
-                    reference=bonus_reference,
-                    description=f"Referral bonus for inviting {request.user.email}",
-                )
-
-                referral.bonus_paid = True
-                referral.bonus_amount = REFERRAL_BONUS_AMOUNT
-                referral.save(update_fields=["bonus_paid", "bonus_amount"])
-
-                referral_profile, _ = ReferralProfile.objects.get_or_create(
-                    user=referral.referrer
-                )
-
-                referral_profile.total_bonus_earned += REFERRAL_BONUS_AMOUNT
-                referral_profile.save(update_fields=["total_bonus_earned"])
-
-                NotificationService.create_notification(
-                    user=referral.referrer,
-                    notification_type="wallet",
-                    title="Referral Bonus Earned",
-                    message=f"You earned ₦{REFERRAL_BONUS_AMOUNT} for inviting {request.user.email}.",
-                    metadata={
-                        "reference": bonus_reference,
-                        "referred_user": request.user.email,
-                        "amount": str(REFERRAL_BONUS_AMOUNT),
-                    },
-                )
+            award_referral_bonus_if_eligible(
+                request.user
+            )
 
         return Response(PaymentTransactionSerializer(payment).data)
 
@@ -651,6 +726,15 @@ class PaystackWebhookView(APIView):
             )
 
             if payment.status == "success":
+                ensure_wallet_funding_transaction(
+                    payment,
+                    payment.user,
+                )
+
+                award_referral_bonus_if_eligible(
+                    payment.user
+                )
+
                 return Response(
                     {
                         "received": True,
@@ -666,24 +750,6 @@ class PaystackWebhookView(APIView):
                 amount=payment.amount,
                 reference=payment.reference,
                 description="Wallet funding via Paystack",
-            )
-
-            Transaction.objects.get_or_create(
-                reference=payment.reference,
-                defaults={
-                    "user": payment.user,
-                    "service_type": "wallet_funding",
-                    "amount": payment.amount,
-                    "status": "success",
-                    "provider": "paystack",
-                    "provider_reference": payment.reference,
-                    "description": "Wallet funding via Paystack",
-                    "metadata": {
-                        "payment_transaction_id": payment.id,
-                        "payment_method": "paystack",
-                        "source": "wallet_funding",
-                    },
-                },
             )
 
             payment.status = "success"
@@ -722,74 +788,9 @@ class PaystackWebhookView(APIView):
                     payment.reference,
                 )
 
-            referral = (
-                Referral.objects
-                .filter(
-                    referred_user=payment.user,
-                    bonus_paid=False,
-                )
-                .first()
+            award_referral_bonus_if_eligible(
+                payment.user
             )
-
-            if referral:
-                referrer_wallet = referral.referrer.wallet
-
-                bonus_reference = (
-                    f"REF-BONUS-{payment.reference}"
-                )
-
-                WalletService.credit_wallet(
-                    wallet=referrer_wallet,
-                    amount=REFERRAL_BONUS_AMOUNT,
-                    reference=bonus_reference,
-                    description=(
-                        "Referral bonus for inviting "
-                        f"{payment.user.email}"
-                    ),
-                )
-
-                referral.bonus_paid = True
-                referral.bonus_amount = REFERRAL_BONUS_AMOUNT
-
-                referral.save(
-                    update_fields=[
-                        "bonus_paid",
-                        "bonus_amount",
-                    ]
-                )
-
-                referral_profile, _ = (
-                    ReferralProfile.objects.get_or_create(
-                        user=referral.referrer
-                    )
-                )
-
-                referral_profile.total_bonus_earned += (
-                    REFERRAL_BONUS_AMOUNT
-                )
-
-                referral_profile.save(
-                    update_fields=[
-                        "total_bonus_earned"
-                    ]
-                )
-
-                NotificationService.create_notification(
-                    user=referral.referrer,
-                    notification_type="wallet",
-                    title="Referral Bonus Earned",
-                    message=(
-                        f"You earned ₦{REFERRAL_BONUS_AMOUNT} "
-                        f"for inviting {payment.user.email}."
-                    ),
-                    metadata={
-                        "reference": bonus_reference,
-                        "referred_user": payment.user.email,
-                        "amount": str(
-                            REFERRAL_BONUS_AMOUNT
-                        ),
-                    },
-                )
 
         logger.info(
             "Processed charge.success for wallet payment %s",

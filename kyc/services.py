@@ -128,7 +128,15 @@ class KYCService:
             "residential_address": "Residential address is required.",
             "document_type": "Document type is required.",
             "document_number": "Document number is required.",
-            "document_front": "The front of your identity document is required.",
+            "identity_verification_method": (
+                "Identity verification method is required."
+            ),
+            "identity_verification_value": (
+                "Identity verification value is required."
+            ),
+            "document_front": (
+                "The front of your identity document is required."
+            ),
             "selfie": "A selfie is required.",
         }
 
@@ -321,6 +329,12 @@ class KYCService:
                 "updated_at",
             ]
         )
+
+        if not verification.user.is_verified:
+            verification.user.is_verified = True
+            verification.user.save(
+                update_fields=["is_verified"]
+            )
 
         transaction.on_commit(
             lambda: NotificationService.create_notification(

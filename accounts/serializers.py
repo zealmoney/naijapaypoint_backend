@@ -11,7 +11,16 @@ from django.conf import settings
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, min_length=8)
+    password = serializers.CharField(
+        write_only=True,
+        min_length=8,
+    )
+
+    password_confirm = serializers.CharField(
+        write_only=True,
+        min_length=8,
+    )
+
     referral_code = serializers.CharField(
         write_only=True,
         required=False,
@@ -22,51 +31,188 @@ class RegisterSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             "id",
-            "email",
+            "first_name",
+            "last_name",
             "username",
+            "email",
             "phone_number",
             "password",
+            "password_confirm",
             "referral_code",
         ]
+        
+    def validate_referral_code(self, value):
+        code = value.strip().upper()
+
+        if not code:
+            return ""
+
+        if not ReferralProfile.objects.filter(
+            referral_code=code
+        ).exists():
+            raise serializers.ValidationError(
+                "Invalid referral code."
+            )
+
+        return code
+
+    def validate(self, attrs):
+        if attrs["password"] != attrs["password_confirm"]:
+            raise serializers.ValidationError(
+                {
+                    "password_confirm":
+                        "Passwords do not match."
+                }
+            )
+
+        return attrs
 
     def create(self, validated_data):
-        referral_code = validated_data.pop("referral_code", "")
+        referral_code = validated_data.pop(
+            "referral_code",
+            "",
+        )
 
-        user = User.objects.create_user(**validated_data)
+        validated_data.pop(
+            "password_confirm"
+        )
+
+        user = User.objects.create_user(
+            **validated_data
+        )
 
         if referral_code:
-            try:
-                referral_profile = ReferralProfile.objects.get(
+            referral_profile = (
+                ReferralProfile.objects.get(
                     referral_code=referral_code
                 )
+            )
 
-                if referral_profile.user != user:
-                    Referral.objects.create(
-                        referrer=referral_profile.user,
-                        referred_user=user,
-                        referral_code=referral_code,
-                    )
+            Referral.objects.create(
+                referrer=referral_profile.user,
+                referred_user=user,
+                referral_code=referral_code,
+            )
 
-                    referral_profile.total_referrals += 1
-                    referral_profile.save(update_fields=["total_referrals"])
-
-            except ReferralProfile.DoesNotExist:
-                pass
+            referral_profile.total_referrals += 1
+            referral_profile.save(
+                update_fields=[
+                    "total_referrals"
+                ]
+            )
 
         return user
+
+    def validate_username(self, value):
+        username = value.strip().lower()
+
+        if User.objects.filter(
+            username__iexact=username
+        ).exists():
+            raise serializers.ValidationError(
+                "This username is already taken."
+            )
+
+        return username
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
             "id",
-            "email",
+            "first_name",
+            "last_name",
             "username",
+            "email",
             "phone_number",
             "is_verified",
             "is_staff",
             "is_superuser",
         ]
+        read_only_fields = [
+            "id",
+            "email",
+            "is_verified",
+            "is_staff",
+            "is_superuser",
+        ]
+
+    def validate_first_name(self, value):
+        first_name = value.strip()
+
+        if not first_name:
+            raise serializers.ValidationError(
+                "First name is required."
+            )
+
+        return first_name
+
+    def validate_last_name(self, value):
+        last_name = value.strip()
+
+        if not last_name:
+            raise serializers.ValidationError(
+                "Last name is required."
+            )
+
+        return last_name
+
+    def validate_username(self, value):
+        username = value.strip().lower()
+
+        if not username:
+            raise serializers.ValidationError(
+                "Username is required."
+            )
+
+        queryset = User.objects.filter(
+            username__iexact=username
+        )
+
+        if self.instance:
+            queryset = queryset.exclude(
+                pk=self.instance.pk
+            )
+
+        if queryset.exists():
+            raise serializers.ValidationError(
+                "This username is already taken."
+            )
+
+        return username
+
+    def validate_phone_number(self, value):
+        phone_number = value.strip()
+
+        if not phone_number:
+            raise serializers.ValidationError(
+                "Phone number is required."
+            )
+
+        cleaned_number = (
+            phone_number
+            .replace(" ", "")
+            .replace("-", "")
+            .replace("(", "")
+            .replace(")", "")
+        )
+
+        if cleaned_number.startswith("+"):
+            digits = cleaned_number[1:]
+        else:
+            digits = cleaned_number
+
+        if not digits.isdigit():
+            raise serializers.ValidationError(
+                "Enter a valid phone number."
+            )
+
+        if len(digits) < 10 or len(digits) > 15:
+            raise serializers.ValidationError(
+                "Enter a valid phone number."
+            )
+
+        return cleaned_number
 
 User = get_user_model()
 

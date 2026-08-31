@@ -136,9 +136,9 @@ class KYCUpdateView(APIView):
                 "Start your KYC verification before updating it."
             ) from exc
 
+
     @transaction.atomic
     def patch(self, request):
-        print(">>> USING UPDATED KYCUpdateView <<<")
         verification = (
             KYCVerification.objects
             .select_for_update()

@@ -128,61 +128,6 @@ class KYCVerification(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     verification_provider = models.CharField(
-        max_length=50,
-        blank=True,
-    )
-
-    provider_reference = models.CharField(
-        max_length=150,
-        blank=True,
-        db_index=True,
-    )
-
-    automated_verification_status = models.CharField(
-        max_length=30,
-        choices=[
-            ("not_started", "Not Started"),
-            ("pending", "Pending"),
-            ("passed", "Passed"),
-            ("failed", "Failed"),
-            ("error", "Error"),
-        ],
-        default="not_started",
-    )
-
-    document_authentic = models.BooleanField(
-        null=True,
-        blank=True,
-    )
-
-    face_match_passed = models.BooleanField(
-        null=True,
-        blank=True,
-    )
-
-    liveness_passed = models.BooleanField(
-        null=True,
-        blank=True,
-    )
-
-    face_match_score = models.DecimalField(
-        max_digits=6,
-        decimal_places=3,
-        null=True,
-        blank=True,
-    )
-
-    provider_result = models.JSONField(
-        default=dict,
-        blank=True,
-    )
-
-    automated_verified_at = models.DateTimeField(
-        null=True,
-        blank=True,
-    )
-
-    verification_provider = models.CharField(
         max_length=30,
         blank=True,
         default="",
