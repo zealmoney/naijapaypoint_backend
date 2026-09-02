@@ -15,13 +15,14 @@ from decouple import config
 import dj_database_url
 import os
 from dotenv import load_dotenv
+from datetime import timedelta
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 load_dotenv(BASE_DIR / ".env")
 
 SECRET_KEY = config("SECRET_KEY")
-DEBUG = config("DEBUG", default=True, cast=bool)
+DEBUG = config("DEBUG", default=False, cast=bool)
 
 PAYSTACK_SECRET_KEY = config("PAYSTACK_SECRET_KEY", default="")
 PAYSTACK_CALLBACK_URL = config("PAYSTACK_CALLBACK_URL", default="")
@@ -68,15 +69,13 @@ DEFAULT_FROM_EMAIL = config(
 )
 
 ALLOWED_HOSTS = [
-    "naijapaypointbackend-production.up.railway.app",
-    "naijapaypoint-backend-production.up.railway.app",
-    "localhost",
-    "127.0.0.1",
-    "10.0.0.7",
-    ".vercel.app",
+    host.strip()
+    for host in config(
+        "ALLOWED_HOSTS",
+        default="localhost,127.0.0.1",
+    ).split(",")
+    if host.strip()
 ]
-
-FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:3000")
 
 AUTH_USER_MODEL = "accounts.User"
 
@@ -92,6 +91,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     'rest_framework',
+    "rest_framework_simplejwt.token_blacklist",
     'corsheaders',
 
     'accounts',
@@ -154,28 +154,37 @@ DATABASES = {
     "default": dj_database_url.parse(config("DATABASE_URL"))
 }
 
-#USE_SQLITE = config("USE_SQLITE", default=False, cast=bool)
-
-#if USE_SQLITE:
-#    DATABASES = {
-#        "default": {
-#            "ENGINE": "django.db.backends.sqlite3",
-#            "NAME": BASE_DIR / "db.sqlite3",
-#        }
-#    }
-#else:
-#    DATABASES = {
-#        "default": dj_database_url.parse(config("DATABASE_URL"))
-#    }
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
+
     "DEFAULT_THROTTLE_RATES": {
         "anon": "20/min",
         "user": "100/min",
+
+        "login": "5/min",
+        "register": "5/min",
+        "password_reset": "3/min",
+        "password_reset_confirm": "5/min",
+        "token_refresh": "30/min",
     },
+}
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+
+    "UPDATE_LAST_LOGIN": False,
+
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": SECRET_KEY,
+
+    "AUTH_HEADER_TYPES": ("Bearer",),
 }
 
 
@@ -220,6 +229,39 @@ MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:8081",
+    origin.strip()
+    for origin in config(
+        "CORS_ALLOWED_ORIGINS",
+        default="http://localhost:3000,http://localhost:8081",
+    ).split(",")
+    if origin.strip()
 ]
+
+# ---------------------------------------------------------
+# Production security
+# ---------------------------------------------------------
+
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = (
+        "HTTP_X_FORWARDED_PROTO",
+        "https",
+    )
+
+    SECURE_SSL_REDIRECT = True
+
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = "Lax"
+
+    CSRF_COOKIE_SECURE = True
+    CSRF_COOKIE_SAMESITE = "Lax"
+
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    X_FRAME_OPTIONS = "DENY"
+
+    SECURE_REFERRER_POLICY = "same-origin"
+
+    # Start HSTS conservatively.
+    SECURE_HSTS_SECONDS = 3600
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = False
+    SECURE_HSTS_PRELOAD = False
