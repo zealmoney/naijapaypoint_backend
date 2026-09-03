@@ -40,11 +40,9 @@ DOJAH_APP_ID = os.getenv("DOJAH_APP_ID", "")
 DOJAH_SECRET_KEY = os.getenv("DOJAH_SECRET_KEY", "")
 DOJAH_TIMEOUT = int(os.getenv("DOJAH_TIMEOUT", "30"))
 
-if not DEBUG and (
-    not DOJAH_APP_ID or not DOJAH_SECRET_KEY
-):
+if not DOJAH_APP_ID or not DOJAH_SECRET_KEY:
     raise RuntimeError(
-        "Dojah production credentials are not configured."
+        "Dojah credentials are not configured."
     )
 
 FRONTEND_URL = config(
