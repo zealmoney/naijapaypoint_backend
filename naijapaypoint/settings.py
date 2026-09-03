@@ -40,11 +40,6 @@ DOJAH_APP_ID = config("DOJAH_APP_ID", default="")
 DOJAH_SECRET_KEY = config("DOJAH_SECRET_KEY", default="")
 DOJAH_TIMEOUT = config("DOJAH_TIMEOUT", default=30, cast=int)
 
-if not DOJAH_APP_ID or not DOJAH_SECRET_KEY:
-    raise RuntimeError(
-        "Dojah credentials are not configured."
-    )
-
 FRONTEND_URL = config(
     "FRONTEND_URL",
     default="http://localhost:3000",
