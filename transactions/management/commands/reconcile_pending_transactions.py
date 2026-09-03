@@ -563,7 +563,7 @@ class Command(BaseCommand):
     ):
         main_tx = (
             Transaction.objects
-            .select_for_update()
+            .select_for_update(of=("self",))
             .select_related(
                 "user",
                 "user__wallet",
