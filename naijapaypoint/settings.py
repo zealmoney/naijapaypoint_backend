@@ -31,14 +31,14 @@ VTPASS_BASE_URL = config("VTPASS_BASE_URL", default="")
 VTPASS_API_KEY = config("VTPASS_API_KEY", default="")
 VTPASS_SECRET_KEY = config("VTPASS_SECRET_KEY", default="")
 
-DOJAH_BASE_URL = os.getenv(
+DOJAH_BASE_URL = config(
     "DOJAH_BASE_URL",
-    "https://sandbox.dojah.io",
+    default="https://sandbox.dojah.io",
 )
 
-DOJAH_APP_ID = os.getenv("DOJAH_APP_ID", "")
-DOJAH_SECRET_KEY = os.getenv("DOJAH_SECRET_KEY", "")
-DOJAH_TIMEOUT = int(os.getenv("DOJAH_TIMEOUT", "30"))
+DOJAH_APP_ID = config("DOJAH_APP_ID", default="")
+DOJAH_SECRET_KEY = config("DOJAH_SECRET_KEY", default="")
+DOJAH_TIMEOUT = config("DOJAH_TIMEOUT", default=30, cast=int)
 
 if not DOJAH_APP_ID or not DOJAH_SECRET_KEY:
     raise RuntimeError(
