@@ -161,6 +161,7 @@ REST_FRAMEWORK = {
         "register": "5/min",
         "password_reset": "3/min",
         "password_reset_confirm": "5/min",
+        "change_password": "5/min",
         "token_refresh": "30/min",
     },
 }

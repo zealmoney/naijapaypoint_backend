@@ -14,7 +14,11 @@ from rest_framework_simplejwt.exceptions import TokenError
 from .models import User
 from .serializers import RegisterSerializer, UserSerializer
 
-from .serializers import PasswordResetRequestSerializer, PasswordResetConfirmSerializer
+from .serializers import (
+    PasswordResetRequestSerializer,
+    PasswordResetConfirmSerializer,
+    ChangePasswordSerializer,
+)
 
 
 class RegisterView(generics.CreateAPIView):
@@ -94,6 +98,29 @@ class PasswordResetConfirmView(APIView):
             {
                 "detail":
                     "Password has been reset successfully."
+            }
+        )
+
+
+class ChangePasswordView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "change_password"
+
+    def post(self, request):
+        serializer = ChangePasswordSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(
+            raise_exception=True
+        )
+        serializer.save()
+
+        return Response(
+            {
+                "detail":
+                    "Password changed successfully."
             }
         )
 
