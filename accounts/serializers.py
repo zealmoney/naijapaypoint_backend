@@ -77,7 +77,17 @@ class RegisterSerializer(serializers.ModelSerializer):
                 }
             )
 
-        validate_password(attrs["password"])
+        candidate_user = User(
+            username=attrs.get("username", ""),
+            email=attrs.get("email", ""),
+            first_name=attrs.get("first_name", ""),
+            last_name=attrs.get("last_name", ""),
+        )
+
+        validate_password(
+            attrs["password"],
+            user=candidate_user,
+        )
 
         return attrs
 
