@@ -171,18 +171,23 @@ class KYCVerificationSerializer(serializers.ModelSerializer):
     ) -> str:
         value = obj.identity_verification_value or ""
 
-        if not value:
-            return ""
+        if value:
+            visible_characters = 4
 
-        visible_characters = 4
+            if len(value) <= visible_characters:
+                return "*" * len(value)
 
-        if len(value) <= visible_characters:
-            return "*" * len(value)
+            return (
+                "*" * (len(value) - visible_characters)
+                + value[-visible_characters:]
+            )
 
-        return (
-            "*" * (len(value) - visible_characters)
-            + value[-visible_characters:]
-        )
+        last4 = obj.identity_verification_last4 or ""
+
+        if last4:
+            return f"*******{last4}"
+
+        return ""
 
 
 class KYCUpdateSerializer(serializers.ModelSerializer):
@@ -460,27 +465,9 @@ class AdminKYCDetailSerializer(KYCVerificationSerializer):
 
     def get_automated_verification_summary(self, obj):
         provider_response = obj.provider_response or {}
-        entity = provider_response.get("entity") or {}
 
         return {
-            "verification": entity.get("verification"),
-            "first_name": entity.get("first_name"),
-            "middle_name": entity.get("middle_name"),
-            "last_name": entity.get("last_name"),
-            "date_of_birth": (
-                entity.get("date_of_birth")
-                or entity.get("dob")
-            ),
-            "gender": entity.get("gender"),
-            "phone_number": (
-                entity.get("phone_number")
-                or entity.get("phone")
-            ),
-            "identity_number": (
-                entity.get("identity_number")
-                or entity.get("bvn")
-                or entity.get("nin")
-            ),
+            "verification": provider_response.get("verification"),
         }
 
 class KYCApproveSerializer(serializers.Serializer):

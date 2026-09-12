@@ -86,12 +86,8 @@ class DojahService:
             ) from exc
 
         if not response.ok:
-            message = (
-                payload.get("error")
-                or payload.get("message")
-                or "Dojah identity verification failed."
+            raise DojahAPIError(
+                "Dojah identity verification failed."
             )
-
-            raise DojahAPIError(str(message))
 
         return payload

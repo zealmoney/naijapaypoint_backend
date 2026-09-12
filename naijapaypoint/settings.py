@@ -72,6 +72,9 @@ ALLOWED_HOSTS = [
 
 AUTH_USER_MODEL = "accounts.User"
 
+AUTHENTICATION_BACKENDS = [
+    "accounts.backends.CaseInsensitiveEmailBackend",
+]
 
 # Application definition
 
@@ -86,6 +89,7 @@ INSTALLED_APPS = [
     'rest_framework',
     "rest_framework_simplejwt.token_blacklist",
     'corsheaders',
+    "storages",
 
     'accounts',
     'wallets.apps.WalletsConfig',
@@ -150,7 +154,7 @@ DATABASES = {
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "accounts.authentication.TokenVersionJWTAuthentication",
     ),
 
     "DEFAULT_THROTTLE_RATES": {
@@ -221,6 +225,32 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+if not DEBUG:
+    STORAGES = {
+        "default": {
+            "BACKEND": "storages.backends.s3.S3Storage",
+            "OPTIONS": {
+                "access_key": config("AWS_ACCESS_KEY_ID"),
+                "secret_key": config("AWS_SECRET_ACCESS_KEY"),
+                "bucket_name": config("AWS_S3_BUCKET_NAME"),
+                "region_name": config(
+                    "AWS_DEFAULT_REGION",
+                    default="auto",
+                ),
+                "endpoint_url": config("AWS_ENDPOINT_URL"),
+                "querystring_auth": True,
+                "querystring_expire": 300,
+                "file_overwrite": False,
+            },
+        },
+        "staticfiles": {
+            "BACKEND": (
+                "django.contrib.staticfiles.storage."
+                "StaticFilesStorage"
+            ),
+        },
+    }
 
 CORS_ALLOWED_ORIGINS = [
     origin.strip()

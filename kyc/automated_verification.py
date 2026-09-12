@@ -93,13 +93,22 @@ class KYCAutomatedVerificationService:
         entity = response.get("entity") or {}
         passed = bool(entity.get("verification"))
 
+        safe_provider_result = {
+            "verification": entity.get("verification"),
+        }
+
         verification.provider_reference = customer_reference
-        verification.provider_response = response
+        verification.provider_response = safe_provider_result
         verification.identity_match_passed = passed
         verification.automated_verification_status = (
             "passed" if passed else "failed"
         )
         verification.automated_verified_at = timezone.now()
+        verification.identity_verification_last4 = (
+            verification.identity_verification_value[-4:]
+        )
+        verification.identity_verification_value = ""
+
         verification.save(
             update_fields=[
                 "provider_reference",
@@ -107,6 +116,8 @@ class KYCAutomatedVerificationService:
                 "identity_match_passed",
                 "automated_verification_status",
                 "automated_verified_at",
+                "identity_verification_last4",
+                "identity_verification_value",
                 "updated_at",
             ]
         )

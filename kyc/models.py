@@ -201,6 +201,12 @@ class KYCVerification(models.Model):
         default="",
     )
 
+    identity_verification_last4 = models.CharField(
+        max_length=4,
+        blank=True,
+        default="",
+    )
+
     class Meta:
         ordering = ["-created_at"]
         verbose_name = "KYC Verification"

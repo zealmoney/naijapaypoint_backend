@@ -9,13 +9,33 @@ from django.utils.encoding import force_bytes
 from django.core.mail import send_mail
 from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
+from django.db import IntegrityError, transaction
+from django.db.models import F
+
 from rest_framework_simplejwt.token_blacklist.models import (
     OutstandingToken,
     BlacklistedToken,
 )
+from .utils import (
+    normalize_nigerian_phone,
+    PhoneNormalizationError,
+)
+
+from django.contrib.auth import get_user_model
+from rest_framework_simplejwt.serializers import (
+    TokenObtainPairSerializer,
+    TokenRefreshSerializer,
+)
+from rest_framework_simplejwt.exceptions import InvalidToken
 
 
 def blacklist_user_tokens(user):
+    type(user).objects.filter(pk=user.pk).update(
+        token_version=F("token_version") + 1
+    )
+
+    user.refresh_from_db(fields=["token_version"])
+
     for token in OutstandingToken.objects.filter(user=user):
         BlacklistedToken.objects.get_or_create(
             token=token
@@ -101,29 +121,40 @@ class RegisterSerializer(serializers.ModelSerializer):
             "password_confirm"
         )
 
-        user = User.objects.create_user(
-            **validated_data
-        )
-
-        if referral_code:
-            referral_profile = (
-                ReferralProfile.objects.get(
-                    referral_code=referral_code
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    **validated_data
                 )
-            )
 
-            Referral.objects.create(
-                referrer=referral_profile.user,
-                referred_user=user,
-                referral_code=referral_code,
-            )
+                if referral_code:
+                    referral_profile = (
+                        ReferralProfile.objects.select_for_update().get(
+                            referral_code=referral_code
+                        )
+                    )
 
-            referral_profile.total_referrals += 1
-            referral_profile.save(
-                update_fields=[
-                    "total_referrals"
-                ]
-            )
+                    Referral.objects.create(
+                        referrer=referral_profile.user,
+                        referred_user=user,
+                        referral_code=referral_code,
+                    )
+
+                    ReferralProfile.objects.filter(
+                        pk=referral_profile.pk
+                    ).update(
+                        total_referrals=F("total_referrals") + 1
+                    )
+
+        except IntegrityError as exc:
+            raise serializers.ValidationError(
+                {
+                    "detail": (
+                        "An account with this username, "
+                        "email, or phone number already exists."
+                    )
+                }
+            ) from exc
 
         return user
 
@@ -138,6 +169,60 @@ class RegisterSerializer(serializers.ModelSerializer):
             )
 
         return username
+
+    def validate_email(self, value):
+        email = value.strip().lower()
+
+        if User.objects.filter(email__iexact=email).exists():
+            raise serializers.ValidationError(
+                "An account with this email already exists."
+            )
+
+        return email
+
+    def validate_phone_number(self, value):
+        try:
+            phone_number = normalize_nigerian_phone(value)
+        except PhoneNormalizationError as exc:
+            raise serializers.ValidationError(str(exc))
+
+        if User.objects.filter(
+            phone_number=phone_number
+        ).exists():
+            raise serializers.ValidationError(
+                "An account with this phone number already exists."
+            )
+
+        return phone_number
+
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        token["token_version"] = user.token_version
+        return token
+
+class CustomTokenRefreshSerializer(TokenRefreshSerializer):
+    def validate(self, attrs):
+        refresh = self.token_class(attrs["refresh"])
+
+        user_id = refresh.get("user_id")
+        token_version = refresh.get("token_version")
+
+        User = get_user_model()
+
+        try:
+            user = User.objects.get(pk=user_id)
+        except User.DoesNotExist:
+            raise InvalidToken("Token is no longer valid.")
+
+        if (
+            token_version is None
+            or token_version != user.token_version
+        ):
+            raise InvalidToken("Token is no longer valid.")
+
+        return super().validate(attrs)
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
@@ -206,55 +291,53 @@ class UserSerializer(serializers.ModelSerializer):
         return username
 
     def validate_phone_number(self, value):
-        phone_number = value.strip()
+        try:
+            phone_number = normalize_nigerian_phone(value)
+        except PhoneNormalizationError as exc:
+            raise serializers.ValidationError(str(exc))
 
-        if not phone_number:
-            raise serializers.ValidationError(
-                "Phone number is required."
-            )
-
-        cleaned_number = (
-            phone_number
-            .replace(" ", "")
-            .replace("-", "")
-            .replace("(", "")
-            .replace(")", "")
+        queryset = User.objects.filter(
+            phone_number=phone_number
         )
 
-        if cleaned_number.startswith("+"):
-            digits = cleaned_number[1:]
-        else:
-            digits = cleaned_number
+        if self.instance:
+            queryset = queryset.exclude(pk=self.instance.pk)
 
-        if not digits.isdigit():
+        if queryset.exists():
             raise serializers.ValidationError(
-                "Enter a valid phone number."
+                "An account with this phone number already exists."
             )
 
-        if len(digits) < 10 or len(digits) > 15:
-            raise serializers.ValidationError(
-                "Enter a valid phone number."
-            )
-
-        return cleaned_number
+        return phone_number
 
 User = get_user_model()
 
 class PasswordResetRequestSerializer(serializers.Serializer):
     email = serializers.EmailField()
 
+    def validate_email(self, value):
+        return value.strip().lower()
+
     def save(self):
         email = self.validated_data["email"]
 
         try:
-            user = User.objects.get(email=email)
+            user = User.objects.get(email__iexact=email)
         except User.DoesNotExist:
             return
 
-        uid = urlsafe_base64_encode(force_bytes(user.pk))
-        token = default_token_generator.make_token(user)
+        uid = urlsafe_base64_encode(
+            force_bytes(user.pk)
+        )
 
-        reset_link = f"{settings.FRONTEND_URL}/reset-password/{uid}/{token}"
+        token = default_token_generator.make_token(
+            user
+        )
+
+        reset_link = (
+            f"{settings.FRONTEND_URL}"
+            f"/reset-password/{uid}/{token}"
+        )
 
         send_mail(
             subject="Reset your NaijaPayPoint password",

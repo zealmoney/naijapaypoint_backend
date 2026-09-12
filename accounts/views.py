@@ -2,6 +2,8 @@ from rest_framework import generics, permissions
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from django.contrib.auth import get_user_model
 
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
@@ -15,9 +17,14 @@ from .models import User
 from .serializers import RegisterSerializer, UserSerializer
 
 from .serializers import (
+    RegisterSerializer,
+    UserSerializer,
     PasswordResetRequestSerializer,
     PasswordResetConfirmSerializer,
     ChangePasswordSerializer,
+    CustomTokenObtainPairSerializer,
+    CustomTokenRefreshSerializer,
+    blacklist_user_tokens,
 )
 
 
@@ -125,18 +132,20 @@ class ChangePasswordView(APIView):
         )
 
 class LoginView(TokenObtainPairView):
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "login"
+    serializer_class = CustomTokenObtainPairSerializer
 
 
 class RefreshTokenView(TokenRefreshView):
     permission_classes = [permissions.AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "token_refresh"
+    serializer_class = CustomTokenRefreshSerializer
 
 class LogoutView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
 
     def post(self, request):
         refresh_token = request.data.get("refresh")
@@ -149,14 +158,26 @@ class LogoutView(APIView):
 
         try:
             token = RefreshToken(refresh_token)
+            user_id = token.get("user_id")
 
-            if str(token.get("user_id")) != str(request.user.pk):
+            if not user_id:
                 return Response(
                     {"detail": "Invalid refresh token."},
                     status=400,
                 )
 
-            token.blacklist()
+            User = get_user_model()
+
+            try:
+                user = User.objects.get(pk=user_id)
+            except User.DoesNotExist:
+                return Response(
+                    {"detail": "Invalid refresh token."},
+                    status=400,
+                )
+
+            blacklist_user_tokens(user)
+
         except TokenError:
             return Response(
                 {"detail": "Invalid or expired refresh token."},
