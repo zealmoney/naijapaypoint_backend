@@ -226,7 +226,13 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
-if not DEBUG:
+USE_S3_STORAGE = config(
+    "USE_S3_STORAGE",
+    default=False,
+    cast=bool,
+)
+
+if USE_S3_STORAGE:
     STORAGES = {
         "default": {
             "BACKEND": "storages.backends.s3.S3Storage",
