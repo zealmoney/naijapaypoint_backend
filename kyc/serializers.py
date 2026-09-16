@@ -3,24 +3,41 @@ from __future__ import annotations
 from pathlib import Path
 
 from rest_framework import serializers
+from rest_framework.reverse import reverse
 
 from .models import KYCVerification
 from .services import KYCService
+from PIL import Image
 
 
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_IMAGE_PIXELS = 25_000_000  # 25 megapixels
+
+ALLOWED_IMAGE_TYPES = {
+    "JPEG": {
+        "extensions": {".jpg", ".jpeg"},
+        "content_types": {"image/jpeg"},
+    },
+    "PNG": {
+        "extensions": {".png"},
+        "content_types": {"image/png"},
+    },
+    "WEBP": {
+        "extensions": {".webp"},
+        "content_types": {"image/webp"},
+    },
+}
 
 ALLOWED_IMAGE_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
+    extension
+    for image_type in ALLOWED_IMAGE_TYPES.values()
+    for extension in image_type["extensions"]
 }
 
 ALLOWED_IMAGE_CONTENT_TYPES = {
-    "image/jpeg",
-    "image/png",
-    "image/webp",
+    content_type
+    for image_type in ALLOWED_IMAGE_TYPES.values()
+    for content_type in image_type["content_types"]
 }
 
 
@@ -33,7 +50,9 @@ def validate_kyc_image(uploaded_file):
             "Each image must be 5 MB or smaller."
         )
 
-    extension = Path(uploaded_file.name).suffix.lower()
+    extension = Path(
+        uploaded_file.name
+    ).suffix.lower()
 
     if extension not in ALLOWED_IMAGE_EXTENSIONS:
         raise serializers.ValidationError(
@@ -53,6 +72,60 @@ def validate_kyc_image(uploaded_file):
         raise serializers.ValidationError(
             "The uploaded file is not a supported image type."
         )
+
+    try:
+        uploaded_file.seek(0)
+
+        with Image.open(uploaded_file) as image:
+            actual_format = (
+                image.format or ""
+            ).upper()
+
+            if actual_format not in ALLOWED_IMAGE_TYPES:
+                raise serializers.ValidationError(
+                    "The uploaded file is not a supported image type."
+                )
+
+            expected_type = ALLOWED_IMAGE_TYPES[
+                actual_format
+            ]
+
+            if extension not in expected_type["extensions"]:
+                raise serializers.ValidationError(
+                    "The image file extension does not match its actual format."
+                )
+
+            if (
+                content_type
+                and content_type
+                not in expected_type["content_types"]
+            ):
+                raise serializers.ValidationError(
+                    "The image content type does not match its actual format."
+                )
+
+            width, height = image.size
+
+            if width <= 0 or height <= 0:
+                raise serializers.ValidationError(
+                    "The uploaded image has invalid dimensions."
+                )
+
+            if width * height > MAX_IMAGE_PIXELS:
+                raise serializers.ValidationError(
+                    "The uploaded image dimensions are too large."
+                )
+
+            image.verify()
+
+    except serializers.ValidationError:
+        raise
+    except Exception as exc:
+        raise serializers.ValidationError(
+            "The uploaded file could not be validated as an image."
+        ) from exc
+    finally:
+        uploaded_file.seek(0)
 
     return uploaded_file
 
@@ -77,12 +150,16 @@ class KYCVerificationSerializer(serializers.ModelSerializer):
         serializers.SerializerMethodField()
     )
 
+    masked_document_number = serializers.SerializerMethodField()
+
+    document_front = serializers.SerializerMethodField()
+    document_back = serializers.SerializerMethodField()
+    selfie = serializers.SerializerMethodField()
+
     requires_document_back = serializers.SerializerMethodField()
     can_edit = serializers.SerializerMethodField()
     can_submit = serializers.SerializerMethodField()
     missing_submission_fields = serializers.SerializerMethodField()
-
-    reviewed_by = serializers.SerializerMethodField()
 
     class Meta:
         model = KYCVerification
@@ -100,7 +177,7 @@ class KYCVerificationSerializer(serializers.ModelSerializer):
             "residential_address",
             "document_type",
             "document_type_display",
-            "document_number",
+            "masked_document_number",
             "document_front",
             "document_back",
             "selfie",
@@ -109,9 +186,7 @@ class KYCVerificationSerializer(serializers.ModelSerializer):
             "can_submit",
             "missing_submission_fields",
             "submitted_at",
-            "reviewed_by",
             "reviewed_at",
-            "review_note",
             "rejection_reason",
             "created_at",
             "updated_at",
@@ -120,6 +195,61 @@ class KYCVerificationSerializer(serializers.ModelSerializer):
         )
 
         read_only_fields = fields
+
+    def _get_protected_document_url(
+        self,
+        obj: KYCVerification,
+        field_name: str,
+        document_type: str,
+    ):
+        document = getattr(
+            obj,
+            field_name,
+            None,
+        )
+
+        if not document:
+            return None
+
+        request = self.context.get("request")
+
+        return reverse(
+            "kyc:document",
+            kwargs={
+                "document_type": document_type,
+            },
+            request=request,
+        )
+
+    def get_document_front(
+        self,
+        obj: KYCVerification,
+    ):
+        return self._get_protected_document_url(
+            obj,
+            "document_front",
+            "front",
+        )
+
+    def get_document_back(
+        self,
+        obj: KYCVerification,
+    ):
+        return self._get_protected_document_url(
+            obj,
+            "document_back",
+            "back",
+        )
+
+    def get_selfie(
+        self,
+        obj: KYCVerification,
+    ):
+        return self._get_protected_document_url(
+            obj,
+            "selfie",
+            "selfie",
+        )
 
     def get_requires_document_back(
         self,
@@ -150,21 +280,6 @@ class KYCVerificationSerializer(serializers.ModelSerializer):
             KYCService.get_missing_submission_fields(obj).keys()
         )
 
-    def get_reviewed_by(
-        self,
-        obj: KYCVerification,
-    ):
-        reviewer = obj.reviewed_by
-
-        if not reviewer:
-            return None
-
-        return {
-            "id": reviewer.pk,
-            "email": getattr(reviewer, "email", ""),
-            "name": reviewer.get_full_name(),
-        }
-
     def get_masked_identity_verification_value(
         self,
         obj: KYCVerification,
@@ -183,6 +298,30 @@ class KYCVerificationSerializer(serializers.ModelSerializer):
             )
 
         last4 = obj.identity_verification_last4 or ""
+
+        if last4:
+            return f"*******{last4}"
+
+        return ""
+
+    def get_masked_document_number(
+        self,
+        obj: KYCVerification,
+    ) -> str:
+        value = (obj.document_number or "").strip()
+
+        if value:
+            visible_characters = 4
+
+            if len(value) <= visible_characters:
+                return "*" * len(value)
+
+            return (
+                "*" * (len(value) - visible_characters)
+                + value[-visible_characters:]
+            )
+
+        last4 = (obj.document_number_last4 or "").strip()
 
         if last4:
             return f"*******{last4}"
@@ -354,6 +493,30 @@ class KYCUpdateSerializer(serializers.ModelSerializer):
             None,
         )
 
+        identity_method_changed = (
+            "identity_verification_method" in validated_data
+            and validated_data["identity_verification_method"]
+            != instance.identity_verification_method
+        )
+
+        identity_value_changed = (
+            "identity_verification_value" in validated_data
+            and validated_data["identity_verification_value"]
+            != instance.identity_verification_value
+        )
+
+        document_number_changed = (
+            "document_number" in validated_data
+            and validated_data["document_number"]
+            != instance.document_number
+        )
+
+        if identity_method_changed or identity_value_changed:
+            instance.identity_verification_last4 = ""
+
+        if document_number_changed:
+            instance.document_number_last4 = ""
+
         # Editing a rejected application moves it back into draft mode.
         if instance.status in {
             KYCVerification.Status.NOT_STARTED,
@@ -436,6 +599,12 @@ class AdminKYCDetailSerializer(KYCVerificationSerializer):
         serializers.SerializerMethodField()
     )
 
+    reviewed_by = serializers.SerializerMethodField()
+
+    document_front = serializers.SerializerMethodField()
+    document_back = serializers.SerializerMethodField()
+    selfie = serializers.SerializerMethodField()
+
     class Meta(KYCVerificationSerializer.Meta):
         fields = KYCVerificationSerializer.Meta.fields + (
             "customer",
@@ -452,6 +621,9 @@ class AdminKYCDetailSerializer(KYCVerificationSerializer):
             "automated_verification_error",
             "automated_verification_summary",
             "masked_identity_verification_value",
+            "review_note",
+            "document_number",
+            "reviewed_by",
         )
 
         read_only_fields = fields
@@ -463,12 +635,73 @@ class AdminKYCDetailSerializer(KYCVerificationSerializer):
             "name": obj.user.get_full_name(),
         }
 
+    def get_reviewed_by(
+        self,
+        obj: KYCVerification,
+    ):
+        reviewer = obj.reviewed_by
+
+        if not reviewer:
+            return None
+
+        return {
+            "id": reviewer.pk,
+            "email": getattr(reviewer, "email", ""),
+            "name": reviewer.get_full_name(),
+        }
+
     def get_automated_verification_summary(self, obj):
         provider_response = obj.provider_response or {}
 
         return {
             "verification": provider_response.get("verification"),
         }
+
+    def _get_admin_document_url(
+        self,
+        obj: KYCVerification,
+        field_name: str,
+        document_type: str,
+    ):
+        document = getattr(obj, field_name, None)
+
+        if not document:
+            return None
+
+        request = self.context.get("request")
+
+        return reverse(
+            "kyc:admin-document",
+            kwargs={
+                "verification_id": obj.id,
+                "document_type": document_type,
+            },
+            request=request,
+        )
+
+
+    def get_document_front(self, obj):
+        return self._get_admin_document_url(
+            obj,
+            "document_front",
+            "front",
+        )
+
+
+    def get_document_back(self, obj):
+        return self._get_admin_document_url(
+            obj,
+            "document_back",
+            "back",
+        )
+
+
+    def get_selfie(self, obj):
+        return self._get_admin_document_url(
+            obj,
+            "selfie",
+            "selfie",
+        )
 
 class KYCApproveSerializer(serializers.Serializer):
     review_note = serializers.CharField(

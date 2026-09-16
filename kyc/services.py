@@ -145,7 +145,7 @@ class KYCService:
         for field_name, message in required_fields.items():
             value = getattr(verification, field_name, None)
 
-            if value is None:
+            if not value:
                 errors[field_name] = message
                 continue
 
@@ -295,6 +295,27 @@ class KYCService:
         verification.reviewed_at = now
         verification.review_note = review_note.strip()
         verification.rejection_reason = ""
+        raw_identity_value = (
+            verification.identity_verification_value or ""
+        ).strip()
+
+        if raw_identity_value:
+            verification.identity_verification_last4 = (
+                raw_identity_value[-4:]
+            )
+
+        verification.identity_verification_value = ""
+
+        raw_document_number = (
+            verification.document_number or ""
+        ).strip()
+
+        if raw_document_number:
+            verification.document_number_last4 = (
+                raw_document_number[-4:]
+            )
+
+        verification.document_number = ""
 
         metadata: dict[str, Any] = verification.metadata or {}
         review_history = metadata.get("review_history", [])
@@ -306,8 +327,6 @@ class KYCService:
             {
                 "action": "approved",
                 "reviewer_id": reviewer.pk,
-                "reviewer_email": getattr(reviewer, "email", ""),
-                "review_note": review_note.strip(),
                 "reviewed_at": now.isoformat(),
             }
         )
@@ -325,6 +344,10 @@ class KYCService:
                 "reviewed_at",
                 "review_note",
                 "rejection_reason",
+                "identity_verification_value",
+                "identity_verification_last4",
+                "document_number",
+                "document_number_last4",
                 "metadata",
                 "updated_at",
             ]
@@ -386,6 +409,27 @@ class KYCService:
         verification.reviewed_at = now
         verification.review_note = review_note.strip()
         verification.rejection_reason = rejection_reason.strip()
+        raw_identity_value = (
+            verification.identity_verification_value or ""
+        ).strip()
+
+        if raw_identity_value:
+            verification.identity_verification_last4 = (
+                raw_identity_value[-4:]
+            )
+
+        verification.identity_verification_value = ""
+
+        raw_document_number = (
+            verification.document_number or ""
+        ).strip()
+
+        if raw_document_number:
+            verification.document_number_last4 = (
+                raw_document_number[-4:]
+            )
+
+        verification.document_number = ""
 
         metadata: dict[str, Any] = verification.metadata or {}
         review_history = metadata.get("review_history", [])
@@ -397,9 +441,6 @@ class KYCService:
             {
                 "action": "rejected",
                 "reviewer_id": reviewer.pk,
-                "reviewer_email": getattr(reviewer, "email", ""),
-                "rejection_reason": rejection_reason.strip(),
-                "review_note": review_note.strip(),
                 "reviewed_at": now.isoformat(),
             }
         )
@@ -417,6 +458,10 @@ class KYCService:
                 "reviewed_at",
                 "review_note",
                 "rejection_reason",
+                "identity_verification_value",
+                "identity_verification_last4",
+                "document_number",
+                "document_number_last4",
                 "metadata",
                 "updated_at",
             ]

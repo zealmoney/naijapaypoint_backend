@@ -20,6 +20,7 @@ class AuditLog(models.Model):
         ("ticket_priority_changed", "Ticket Priority Changed"),
         ("customer_note_added", "Customer Note Added"),
         ("customer_note_deleted", "Customer Note Deleted"),
+        ("kyc_document_viewed", "KYC Document Viewed"),
     )
 
     admin_user = models.ForeignKey(

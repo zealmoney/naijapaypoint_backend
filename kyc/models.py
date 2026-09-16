@@ -80,6 +80,12 @@ class KYCVerification(models.Model):
         blank=True,
     )
 
+    document_number_last4 = models.CharField(
+        max_length=4,
+        blank=True,
+        default="",
+    )
+
     document_front = models.ImageField(
         upload_to="kyc/documents/front/%Y/%m/",
         blank=True,
@@ -211,6 +217,12 @@ class KYCVerification(models.Model):
         ordering = ["-created_at"]
         verbose_name = "KYC Verification"
         verbose_name_plural = "KYC Verifications"
+        permissions = [
+            (
+                "review_kycverification",
+                "Can review KYC verifications",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.user.email} - {self.get_status_display()}"

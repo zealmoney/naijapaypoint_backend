@@ -1,5 +1,7 @@
 from django.db import transaction
+from django.http import FileResponse, Http404
 from rest_framework import status
+from pathlib import Path
 from rest_framework.exceptions import NotFound
 from rest_framework.parsers import (
     FormParser,
@@ -26,6 +28,8 @@ from .automated_verification import (
 )
 from .services import KYCService
 from .permissions import IsKYCReviewer
+
+from audit_logs.services import AuditLogService
 
 
 class KYCStatusView(APIView):
@@ -72,6 +76,110 @@ class KYCStatusView(APIView):
             status=status.HTTP_200_OK,
         )
 
+ALLOWED_KYC_DOCUMENTS = {
+    "front": "document_front",
+    "back": "document_back",
+    "selfie": "selfie",
+}
+
+KYC_IMAGE_CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+def _serve_kyc_document(
+    verification: KYCVerification,
+    document_type: str,
+):
+    field_name = ALLOWED_KYC_DOCUMENTS.get(
+        document_type
+    )
+
+    if not field_name:
+        raise Http404
+
+    document = getattr(
+        verification,
+        field_name,
+        None,
+    )
+
+    if not document:
+        raise Http404
+
+    suffix = Path(document.name).suffix.lower()
+
+    content_type = KYC_IMAGE_CONTENT_TYPES.get(
+        suffix,
+        "application/octet-stream",
+    )
+
+    try:
+        document.open("rb")
+    except (FileNotFoundError, OSError) as exc:
+        raise Http404 from exc
+
+    safe_filename = (
+        f"kyc-{document_type}{suffix}"
+        if suffix
+        else f"kyc-{document_type}"
+    )
+
+    response = FileResponse(
+        document,
+        content_type=content_type,
+        as_attachment=False,
+        filename=safe_filename,
+    )
+
+    response["Cache-Control"] = "private, no-store"
+
+    return response
+
+
+class KYCDocumentView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, document_type):
+        try:
+            verification = KYCVerification.objects.get(
+                user=request.user
+            )
+        except KYCVerification.DoesNotExist as exc:
+            raise Http404 from exc
+
+        return _serve_kyc_document(
+            verification,
+            document_type,
+        )
+
+
+class AdminKYCDocumentView(APIView):
+    permission_classes = [IsAuthenticated, IsKYCReviewer]
+
+    def get(self, request, verification_id, document_type):
+        try:
+            verification = KYCVerification.objects.get(pk=verification_id)
+        except KYCVerification.DoesNotExist as exc:
+            raise Http404 from exc
+
+        response = _serve_kyc_document(
+            verification,
+            document_type,
+        )
+
+        AuditLogService.log_action(
+            admin_user=request.user,
+            action_type="kyc_document_viewed",
+            target_reference=str(verification.id),
+            metadata={
+                "document_type": document_type,
+            },
+        )
+
+        return response
 
 class KYCStartView(APIView):
     permission_classes = [IsAuthenticated]
@@ -251,7 +359,6 @@ class AdminKYCListView(APIView):
                 Q(user__email__icontains=search)
                 | Q(first_name__icontains=search)
                 | Q(last_name__icontains=search)
-                | Q(document_number__icontains=search)
             )
 
         queryset = queryset.order_by(

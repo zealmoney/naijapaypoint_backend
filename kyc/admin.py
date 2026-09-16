@@ -5,6 +5,27 @@ from .models import KYCVerification
 
 @admin.register(KYCVerification)
 class KYCVerificationAdmin(admin.ModelAdmin):
+    def has_module_permission(self, request):
+        return request.user.has_perm(
+            "kyc.review_kycverification"
+        )
+
+    def has_view_permission(self, request, obj=None):
+        return request.user.has_perm(
+            "kyc.review_kycverification"
+        )
+
+    def has_change_permission(self, request, obj=None):
+        return request.user.has_perm(
+            "kyc.review_kycverification"
+        )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
     list_display = (
         "user",
         "status",
@@ -28,7 +49,6 @@ class KYCVerificationAdmin(admin.ModelAdmin):
         "user__username",
         "first_name",
         "last_name",
-        "document_number",
     )
 
     readonly_fields = (

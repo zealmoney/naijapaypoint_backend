@@ -11,7 +11,9 @@ from .views import (
     KYCStatusView,
     KYCSubmitView,
     KYCUpdateView,
+    KYCDocumentView,
     AdminKYCRunAutomatedCheckView,
+    AdminKYCDocumentView,
 )
 
 app_name = "kyc"
@@ -37,7 +39,11 @@ urlpatterns = [
         KYCSubmitView.as_view(),
         name="submit",
     ),
-
+    path(
+        "documents/<str:document_type>/",
+        KYCDocumentView.as_view(),
+        name="document",
+    ),
     path(
         "admin/",
         AdminKYCListView.as_view(),
@@ -72,5 +78,10 @@ urlpatterns = [
         "admin/<int:verification_id>/automated-check/",
         AdminKYCRunAutomatedCheckView.as_view(),
         name="admin-automated-check",
+    ),
+    path(
+        "admin/<int:verification_id>/documents/<str:document_type>/",
+        AdminKYCDocumentView.as_view(),
+        name="admin-document",
     ),
 ]
