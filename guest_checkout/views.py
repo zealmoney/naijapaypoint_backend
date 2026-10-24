@@ -2,6 +2,8 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
+from decimal import Decimal, InvalidOperation
+
 from .models import GuestTransaction
 from .serializers import (
     GuestPaymentInitializeSerializer,
@@ -18,6 +20,8 @@ from data_services.services import VTPassDataService
 from .purchase_service import GuestPurchaseService
 from django.conf import settings
 
+import secrets
+
 import logging
 from rest_framework.permissions import AllowAny
 
@@ -25,6 +29,16 @@ from django.db import transaction as database_transaction
 
 from electricity.services import VTPassElectricityService
 from cable.services import VTPassCableService
+
+from common.vtpass_catalogue import (
+    VTPassCatalogueError,
+    get_authoritative_plan,
+)
+
+from common.transaction_status import (
+    classify_vtpass_response,
+    sanitize_vtpass_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +50,96 @@ class GuestInitializePaymentView(APIView):
         serializer.is_valid(raise_exception=True)
 
         reference = GuestReferenceService.generate_reference()
-        amount = serializer.validated_data["amount"]
-        guest_email = serializer.validated_data["guest_email"]
+        validated_data = serializer.validated_data.copy()
+
+        if validated_data["service_type"] == "data":
+            try:
+                catalogue_response = (
+                    VTPassDataService.get_data_plans(
+                        validated_data["provider"]
+                    )
+                )
+
+                authoritative_plan = (
+                    get_authoritative_plan(
+                        catalogue_response,
+                        validated_data.get(
+                            "variation_code"
+                        ),
+                    )
+                )
+
+            except VTPassCatalogueError as exc:
+                return Response(
+                    {"detail": str(exc)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            except Exception:
+                logger.exception(
+                    "Guest data catalogue lookup failed."
+                )
+                return Response(
+                    {
+                        "detail":
+                            "Unable to verify the selected "
+                            "data plan right now."
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+
+            validated_data["amount"] = (
+                authoritative_plan["amount"]
+            )
+            validated_data["plan_name"] = (
+                authoritative_plan["plan_name"]
+            )
+
+        if validated_data["service_type"] == "cable":
+            try:
+                catalogue_response = (
+                    VTPassCableService.get_plans(
+                        validated_data["provider"]
+                    )
+                )
+
+                authoritative_plan = (
+                    get_authoritative_plan(
+                        catalogue_response,
+                        validated_data.get(
+                            "variation_code"
+                        ),
+                    )
+                )
+
+            except VTPassCatalogueError as exc:
+                return Response(
+                    {"detail": str(exc)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            except Exception:
+                logger.exception(
+                    "Guest cable catalogue lookup failed."
+                )
+                return Response(
+                    {
+                        "detail":
+                            "Unable to verify the selected "
+                            "cable plan right now."
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+
+            validated_data["amount"] = (
+                authoritative_plan["amount"]
+            )
+            validated_data["plan_name"] = (
+                authoritative_plan["plan_name"]
+            )
+
+        amount = validated_data["amount"]
+        guest_email = validated_data["guest_email"]
 
         frontend_url = getattr(
             settings,
@@ -55,25 +157,7 @@ class GuestInitializePaymentView(APIView):
                 callback_url=callback_url,
             )
 
-            print(
-                "PAYSTACK INIT RESPONSE:",
-                paystack_response,
-                flush=True,
-            )
-
-            logger.info(
-                "Paystack guest initialization response for %s: %s",
-                reference,
-                paystack_response,
-            )
-
-        except Exception as exc:
-            print(
-                "PAYSTACK INIT EXCEPTION:",
-                repr(exc),
-                flush=True,
-            )
-
+        except Exception:
             logger.exception(
                 "Paystack guest initialization failed for %s",
                 reference,
@@ -82,7 +166,6 @@ class GuestInitializePaymentView(APIView):
             return Response(
                 {
                     "detail": "Unable to initialize guest payment.",
-                    "error": str(exc),
                 },
                 status=status.HTTP_502_BAD_GATEWAY,
             )
@@ -90,8 +173,7 @@ class GuestInitializePaymentView(APIView):
         if not isinstance(paystack_response, dict):
             return Response(
                 {
-                    "detail": "Invalid response received from Paystack.",
-                    "provider_response": str(paystack_response),
+                    "detail": "Unable to initialize guest payment.",
                 },
                 status=status.HTTP_502_BAD_GATEWAY,
             )
@@ -99,13 +181,9 @@ class GuestInitializePaymentView(APIView):
         if paystack_response.get("status") is not True:
             return Response(
                 {
-                    "detail": paystack_response.get(
-                        "message",
-                        "Unable to initialize guest payment.",
-                    ),
-                    "provider_response": paystack_response,
+                    "detail": "Unable to initialize guest payment.",
                 },
-                status=status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_502_BAD_GATEWAY,
             )
 
         paystack_data = paystack_response.get("data") or {}
@@ -114,22 +192,20 @@ class GuestInitializePaymentView(APIView):
         if not authorization_url:
             return Response(
                 {
-                    "detail": (
-                        "Paystack did not return an authorization URL."
-                    ),
-                    "provider_response": paystack_response,
+                    "detail": "Unable to initialize guest payment.",
                 },
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
         transaction = GuestTransaction.objects.create(
             reference=reference,
+            receipt_access_token=secrets.token_urlsafe(32),
             payment_reference=paystack_data.get(
                 "reference",
                 reference,
             ),
             authorization_url=authorization_url,
-            **serializer.validated_data,
+            **validated_data,
         )
 
         response_data = GuestTransactionSerializer(transaction).data
@@ -139,6 +215,7 @@ class GuestInitializePaymentView(APIView):
                 **response_data,
                 "authorization_url": authorization_url,
                 "access_code": paystack_data.get("access_code"),
+                "receipt_access_token": transaction.receipt_access_token,
             },
             status=status.HTTP_201_CREATED,
         )
@@ -155,6 +232,19 @@ class GuestVerifyPaymentView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        receipt_access_token = request.headers.get(
+            "X-Guest-Receipt-Token"
+        )
+
+        if not receipt_access_token:
+            return Response(
+                {
+                    "detail":
+                        "Guest transaction access token is required."
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         try:
             # Claim this transaction before calling Paystack or VTPass.
             with database_transaction.atomic():
@@ -163,6 +253,25 @@ class GuestVerifyPaymentView(APIView):
                     .select_for_update()
                     .get(reference=reference)
                 )
+
+                stored_access_token = (
+                    guest_transaction.receipt_access_token or ""
+                )
+
+                if (
+                    not stored_access_token
+                    or not secrets.compare_digest(
+                        receipt_access_token,
+                        stored_access_token,
+                    )
+                ):
+                    return Response(
+                        {
+                            "detail":
+                                "Guest transaction access denied."
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
 
                 # Idempotent response for an already completed purchase.
                 if guest_transaction.status == "success":
@@ -222,7 +331,7 @@ class GuestVerifyPaymentView(APIView):
             guest_transaction.status = "pending"
             guest_transaction.metadata = {
                 **(guest_transaction.metadata or {}),
-                "paystack_response": paystack_response,
+                "payment_verification": "outcome_unknown",
             }
             guest_transaction.save(
                 update_fields=["status", "metadata"]
@@ -230,15 +339,14 @@ class GuestVerifyPaymentView(APIView):
 
             return Response(
                 {
-                    "detail": paystack_response.get(
-                        "message",
-                        "Payment verification failed.",
+                    "detail": (
+                        "Payment verification could not be confirmed "
+                        "right now. Please try again using your "
+                        "reference."
                     ),
-                    "transaction": GuestTransactionSerializer(
-                        guest_transaction
-                    ).data,
+                    "reference": guest_transaction.reference,
                 },
-                status=status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
         paystack_data = paystack_response.get("data") or {}
@@ -247,7 +355,7 @@ class GuestVerifyPaymentView(APIView):
             guest_transaction.status = "pending"
             guest_transaction.metadata = {
                 **(guest_transaction.metadata or {}),
-                "paystack_response": paystack_response,
+                "payment_verification": "not_completed",
             }
             guest_transaction.save(
                 update_fields=["status", "metadata"]
@@ -256,9 +364,27 @@ class GuestVerifyPaymentView(APIView):
             return Response(
                 {
                     "detail": "Payment has not been completed.",
-                    "transaction": GuestTransactionSerializer(
-                        guest_transaction
-                    ).data,
+                    "reference": guest_transaction.reference,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        verified_currency = str(
+            paystack_data.get("currency") or ""
+        ).upper()
+
+        if verified_currency != "NGN":
+            guest_transaction.status = "pending"
+            guest_transaction.save(
+                update_fields=["status"]
+            )
+
+            return Response(
+                {
+                    "detail":
+                        "Payment currency verification failed.",
+                    "reference":
+                        guest_transaction.reference,
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -275,35 +401,43 @@ class GuestVerifyPaymentView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Paystack returns amounts in kobo.
-        expected_amount = int(guest_transaction.amount * 100)
-        verified_amount = paystack_data.get("amount")
+        # Paystack returns amounts in kobo. Parse the provider value
+        # defensively and never treat malformed payment data as a
+        # refund-eligible service failure.
+        expected_amount = guest_transaction.amount * Decimal("100")
 
-        if verified_amount != expected_amount:
-            guest_transaction.status = "failed"
-            guest_transaction.metadata = {
-                **(guest_transaction.metadata or {}),
-                "paystack_response": paystack_response,
-                "amount_mismatch": {
-                    "expected": expected_amount,
-                    "received": verified_amount,
-                },
-            }
+        try:
+            verified_amount = Decimal(
+                str(paystack_data.get("amount"))
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            verified_amount = None
+
+        amount_is_valid = (
+            verified_amount is not None
+            and verified_amount.is_finite()
+            and verified_amount == expected_amount
+        )
+
+        if not amount_is_valid:
+            guest_transaction.status = "pending"
             guest_transaction.save(
-                update_fields=["status", "metadata"]
+                update_fields=["status"]
             )
 
             return Response(
                 {
-                    "detail": "The verified payment amount is incorrect.",
-                    "reference": guest_transaction.reference,
+                    "detail":
+                        "The verified payment amount is incorrect.",
+                    "reference":
+                        guest_transaction.reference,
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         guest_transaction.metadata = {
             **(guest_transaction.metadata or {}),
-            "paystack_response": paystack_response,
+            "payment_verification": "verified",
         }
         guest_transaction.save(update_fields=["metadata"])
 
@@ -311,29 +445,16 @@ class GuestVerifyPaymentView(APIView):
             provider_response = GuestPurchaseService.execute(
                 guest_transaction
             )
-        except ValueError as exc:
-            guest_transaction.status = "failed"
-            guest_transaction.provider_response = {
-                "error": str(exc),
-            }
-            guest_transaction.save(
-                update_fields=[
-                    "status",
-                    "provider_response",
-                ]
+        except Exception:
+            logger.error(
+                "Guest provider purchase raised an exception "
+                "for reference %s.",
+                guest_transaction.reference,
             )
 
-            return Response(
-                {
-                    "detail": str(exc),
-                    "reference": guest_transaction.reference,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        except Exception as exc:
-            guest_transaction.status = "failed"
+            guest_transaction.status = "pending"
             guest_transaction.provider_response = {
-                "error": str(exc),
+                "result": "provider_outcome_unknown",
             }
             guest_transaction.save(
                 update_fields=[
@@ -346,7 +467,8 @@ class GuestVerifyPaymentView(APIView):
                 {
                     "detail": (
                         "Payment was successful, but the service "
-                        "provider could not complete the purchase."
+                        "provider outcome could not be confirmed. "
+                        "Please contact support with your reference."
                     ),
                     "reference": guest_transaction.reference,
                 },
@@ -355,16 +477,15 @@ class GuestVerifyPaymentView(APIView):
 
         provider_response = provider_response or {}
 
-        is_successful = (
-            str(provider_response.get("code")) == "000"
-            or provider_response.get(
-                "response_description",
-                "",
-            ).strip().lower()
-            == "transaction successful"
+        provider_outcome = classify_vtpass_response(
+            provider_response
         )
 
-        guest_transaction.provider_response = provider_response
+        is_successful = provider_outcome == "success"
+
+        guest_transaction.provider_response = (
+            sanitize_vtpass_response(provider_response)
+        )
         guest_transaction.provider_reference = (
             provider_response.get("requestId")
             or provider_response.get("request_id")
@@ -382,9 +503,14 @@ class GuestVerifyPaymentView(APIView):
                 or ""
             )
 
-        guest_transaction.status = (
-            "success" if is_successful else "failed"
-        )
+        if provider_outcome == "success":
+            guest_transaction.status = "success"
+        elif provider_outcome == "failed":
+            guest_transaction.status = "failed"
+        else:
+            # Pending, manual-review, malformed, and unknown
+            # outcomes must never become refund-eligible failures.
+            guest_transaction.status = "pending"
 
         guest_transaction.save(
             update_fields=[
@@ -399,17 +525,29 @@ class GuestVerifyPaymentView(APIView):
             guest_transaction
         ).data
 
-        if not is_successful:
+        if provider_outcome in {
+            "pending",
+            "manual_review",
+        }:
             return Response(
                 {
                     "detail": (
-                        provider_response.get("response_description")
-                        or provider_response.get("message")
-                        or (
-                            "Payment was successful but the service "
-                            "purchase failed. Please contact support "
-                            "with your reference."
-                        )
+                        "Payment was successful, but the service "
+                        "provider outcome is still being confirmed. "
+                        "Please keep your reference for support."
+                    ),
+                    "transaction": serialized_transaction,
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        if provider_outcome == "failed":
+            return Response(
+                {
+                    "detail": (
+                        "Payment was successful, but the service "
+                        "purchase could not be completed. "
+                        "Please contact support with your reference."
                     ),
                     "transaction": serialized_transaction,
                 },
@@ -422,24 +560,40 @@ class GuestVerifyPaymentView(APIView):
         )
 
 class GuestReceiptView(APIView):
-
-    permission_classes = []
+    permission_classes = [AllowAny]
 
     def get(self, request, reference):
+        receipt_access_token = request.headers.get(
+            "X-Guest-Receipt-Token",
+            "",
+        )
+
+        if not receipt_access_token:
+            return Response(
+                {
+                    "detail":
+                        "Receipt access credentials are required."
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         try:
             transaction = GuestTransaction.objects.get(
-                reference=reference
+                reference=reference,
+                receipt_access_token=receipt_access_token,
             )
         except GuestTransaction.DoesNotExist:
             return Response(
                 {
-                    "detail": "Transaction not found."
+                    "detail":
+                        "Receipt access credentials are invalid."
                 },
-                status=404,
+                status=status.HTTP_403_FORBIDDEN,
             )
 
         return Response(
-            GuestTransactionSerializer(transaction).data
+            GuestTransactionSerializer(transaction).data,
+            status=status.HTTP_200_OK,
         )
 
 class GuestDataPlansView(APIView):

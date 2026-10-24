@@ -6,6 +6,7 @@ from rest_framework.views import APIView
 
 from transactions.models import Transaction
 from wallets.services import WalletService
+from wallets.models import WalletTransaction
 
 from .models import EducationTransaction
 from .serializers import (
@@ -19,9 +20,14 @@ from notifications.services import NotificationService
 
 from common.transaction_status import (
     classify_vtpass_response,
+    sanitize_vtpass_response,
 )
 from common.vtpass_request_id import (
     generate_vtpass_request_id,
+)
+from common.vtpass_catalogue import (
+    VTPassCatalogueError,
+    get_authoritative_plan,
 )
 
 
@@ -114,9 +120,25 @@ class EducationPurchaseView(APIView):
             )
 
             if (
-                education_tx.status
-                != "pending"
+                education_tx.status != "pending"
+                or main_tx.status != "pending"
             ):
+                return (
+                    education_tx,
+                    main_tx,
+                    False,
+                )
+
+            original_debit_exists = (
+                WalletTransaction.objects.filter(
+                    wallet__user=education_tx.user,
+                    reference=reference,
+                    transaction_type="debit",
+                    amount=amount,
+                ).exists()
+            )
+
+            if not original_debit_exists:
                 return (
                     education_tx,
                     main_tx,
@@ -292,16 +314,6 @@ class EducationPurchaseView(APIView):
             "plan_id"
         ]
 
-        plan_name = (
-            serializer.validated_data[
-                "plan_name"
-            ]
-        )
-
-        amount = serializer.validated_data[
-            "amount"
-        ]
-
         quantity = (
             serializer.validated_data[
                 "quantity"
@@ -321,6 +333,51 @@ class EducationPurchaseView(APIView):
                 "",
             )
         )
+
+        try:
+            catalogue_response = (
+                VTPassEducationService.get_plans(
+                    provider
+                )
+            )
+
+            authoritative_plan = (
+                get_authoritative_plan(
+                    catalogue_response,
+                    plan_id,
+                )
+            )
+        except VTPassCatalogueError:
+            return Response(
+                {
+                    "detail":
+                        "Selected education plan is "
+                        "not currently available."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            return Response(
+                {
+                    "detail":
+                        "Unable to validate education "
+                        "plan with provider."
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        plan_id = authoritative_plan[
+            "plan_id"
+        ]
+        plan_name = authoritative_plan[
+            "plan_name"
+        ]
+
+        unit_amount = authoritative_plan[
+            "amount"
+        ]
+
+        amount = unit_amount * quantity
 
         reference = (
             generate_vtpass_request_id(
@@ -403,26 +460,14 @@ class EducationPurchaseView(APIView):
                 )
             )
 
-            print(
-                "VTPASS EDUCATION "
-                "PURCHASE RESPONSE:",
-                provider_response,
-                flush=True,
-            )
-
-        except Exception as exc:
-            print(
-                "VTPASS EDUCATION EXCEPTION:",
-                repr(exc),
-                flush=True,
-            )
+        except Exception:
 
             # IMPORTANT:
             # Do not refund here. The provider
             # may have processed the request
             # even though our connection failed.
+            # Never persist raw exception details.
             provider_response = {
-                "error": str(exc),
                 "response_description": (
                     "Provider request failed"
                 ),
@@ -438,14 +483,16 @@ class EducationPurchaseView(APIView):
             )
         )
 
-        print(
-            "VTPASS EDUCATION RESULT:",
-            provider_result,
-            flush=True,
+        # Retain the original provider response
+        # temporarily for examination PIN, serial
+        # number, and provider reference extraction.
+        # Persist only allowlisted provider data.
+        sanitized_response = sanitize_vtpass_response(
+            provider_response
         )
 
         education_tx.provider_response = (
-            provider_response
+            sanitized_response
         )
 
         education_tx.save(
@@ -457,11 +504,10 @@ class EducationPurchaseView(APIView):
         main_tx.metadata = {
             **(main_tx.metadata or {}),
             "provider_response":
-                provider_response,
+                sanitized_response,
             "provider_result":
                 provider_result,
         }
-
         provider_reference = (
             provider_response.get(
                 "requestId"
@@ -516,6 +562,27 @@ class EducationPurchaseView(APIView):
                     .get(pk=main_tx.pk)
                 )
 
+                if (
+                    education_tx.status != "pending"
+                    or main_tx.status != "pending"
+                ):
+                    return Response(
+                        {
+                            "detail": (
+                                "Education transaction "
+                                "state changed before the "
+                                "success result could be "
+                                "applied."
+                            ),
+                            "reference": reference,
+                            "status":
+                                education_tx.status,
+                        },
+                        status=(
+                            status.HTTP_409_CONFLICT
+                        ),
+                    )
+
                 education_tx.status = (
                     "success"
                 )
@@ -523,7 +590,7 @@ class EducationPurchaseView(APIView):
                 education_tx.pin = pin
 
                 education_tx.provider_response = (
-                    provider_response
+                    sanitized_response
                 )
 
                 education_tx.save(
@@ -543,7 +610,7 @@ class EducationPurchaseView(APIView):
                     ),
                     "pin": pin,
                     "provider_response":
-                        provider_response,
+                        sanitized_response,
                     "provider_result":
                         provider_result,
                     "requires_requery":
@@ -618,16 +685,12 @@ class EducationPurchaseView(APIView):
                     "status": "pending",
                     "provider_result":
                         provider_result,
-                    "provider_response":
-                        provider_response,
                     "transaction":
                         EducationTransactionSerializer(
                             education_tx
                         ).data,
                 },
-                status=(
-                    status.HTTP_202_ACCEPTED
-                ),
+                status=status.HTTP_202_ACCEPTED,
             )
 
         # --------------------------------
@@ -668,8 +731,6 @@ class EducationPurchaseView(APIView):
                         "manual_review",
                     "provider_result":
                         provider_result,
-                    "provider_response":
-                        provider_response,
                     "transaction":
                         EducationTransactionSerializer(
                             education_tx
@@ -696,18 +757,12 @@ class EducationPurchaseView(APIView):
                     amount=amount,
                     reference=reference,
                     provider_response=(
-                        provider_response
+                        sanitized_response
                     ),
                 )
             )
 
-        except Exception as refund_exc:
-            print(
-                "EDUCATION REFUND ERROR:",
-                repr(refund_exc),
-                flush=True,
-            )
-
+        except Exception:
             return Response(
                 {
                     "detail": (
@@ -718,11 +773,26 @@ class EducationPurchaseView(APIView):
                         "Please contact support."
                     ),
                     "reference": reference,
-                    "provider_response":
-                        provider_response,
                 },
                 status=(
                     status.HTTP_500_INTERNAL_SERVER_ERROR
+                ),
+            )
+
+        if not refunded:
+            return Response(
+                {
+                    "detail": (
+                        "Education transaction "
+                        "state changed before the "
+                        "refund could be applied."
+                    ),
+                    "reference": reference,
+                    "status":
+                        education_tx.status,
+                },
+                status=(
+                    status.HTTP_409_CONFLICT
                 ),
             )
 
@@ -734,8 +804,6 @@ class EducationPurchaseView(APIView):
                 ),
                 "provider_result":
                     provider_result,
-                "provider_response":
-                    provider_response,
                 "transaction":
                     EducationTransactionSerializer(
                         education_tx

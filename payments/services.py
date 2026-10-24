@@ -1,4 +1,5 @@
 import requests
+from decimal import Decimal, InvalidOperation
 from django.conf import settings
 
 
@@ -31,12 +32,6 @@ class PaystackService:
         if callback_url:
             payload["callback_url"] = callback_url
 
-        print("========== PAYSTACK INIT ==========")
-        print("REFERENCE:", reference)
-        print("CALLBACK URL:", callback_url)
-        print("PAYSTACK PAYLOAD:", payload)
-        print("===================================")
-
         try:
             response = requests.post(
                 url,
@@ -54,18 +49,15 @@ class PaystackService:
                         "Paystack returned an invalid response."
                     ),
                     "http_status": response.status_code,
-                    "raw_response": response.text,
                 }
 
             if not response.ok:
                 return {
                     "status": False,
-                    "message": response_data.get(
-                        "message",
-                        "Paystack rejected the initialization request.",
+                    "message": (
+                        "Paystack rejected the initialization request."
                     ),
                     "http_status": response.status_code,
-                    "provider_response": response_data,
                 }
 
             return response_data
@@ -76,10 +68,10 @@ class PaystackService:
                 "message": "Paystack initialization request timed out.",
             }
 
-        except requests.RequestException as exc:
+        except requests.RequestException:
             return {
                 "status": False,
-                "message": f"Unable to connect to Paystack: {exc}",
+                "message": "Unable to connect to Paystack.",
             }
 
     @classmethod
@@ -100,18 +92,13 @@ class PaystackService:
                     "status": False,
                     "message": "Paystack returned an invalid response.",
                     "http_status": response.status_code,
-                    "raw_response": response.text,
                 }
 
             if not response.ok:
                 return {
                     "status": False,
-                    "message": response_data.get(
-                        "message",
-                        "Paystack verification failed.",
-                    ),
+                    "message": "Paystack verification failed.",
                     "http_status": response.status_code,
-                    "provider_response": response_data,
                 }
 
             return response_data
@@ -122,10 +109,10 @@ class PaystackService:
                 "message": "Paystack verification request timed out.",
             }
 
-        except requests.RequestException as exc:
+        except requests.RequestException:
             return {
                 "status": False,
-                "message": f"Unable to connect to Paystack: {exc}",
+                "message": "Unable to connect to Paystack.",
             }
 
     @classmethod
@@ -144,7 +131,25 @@ class PaystackService:
         }
 
         if amount is not None:
-            payload["amount"] = int(amount * 100)
+            try:
+                refund_amount = Decimal(str(amount))
+                refund_kobo = refund_amount * Decimal("100")
+
+                if (
+                    not refund_amount.is_finite()
+                    or refund_amount <= 0
+                    or refund_kobo != refund_kobo.to_integral_value()
+                ):
+                    raise ValueError("Invalid refund amount.")
+
+            except (InvalidOperation, ValueError, TypeError):
+                return {
+                    "status": False,
+                    "outcome": "invalid_amount",
+                    "message": "Invalid refund amount.",
+                }
+
+            payload["amount"] = int(refund_kobo)
 
         if customer_note:
             payload["customer_note"] = customer_note
@@ -165,20 +170,19 @@ class PaystackService:
             except ValueError:
                 return {
                     "status": False,
-                    "message": "Paystack returned an invalid refund response.",
+                    "outcome": "unknown",
+                    "message": (
+                        "Paystack refund confirmation is unavailable. "
+                        "Check Paystack before retrying."
+                    ),
                     "http_status": response.status_code,
-                    "raw_response": response.text,
                 }
 
             if not response.ok:
                 return {
                     "status": False,
-                    "message": response_data.get(
-                        "message",
-                        "Paystack rejected the refund request.",
-                    ),
+                    "message": "Paystack rejected the refund request.",
                     "http_status": response.status_code,
-                    "provider_response": response_data,
                 }
 
             return response_data
@@ -186,11 +190,19 @@ class PaystackService:
         except requests.Timeout:
             return {
                 "status": False,
-                "message": "Paystack refund request timed out.",
+                "outcome": "unknown",
+                "message": (
+                    "Refund confirmation is unavailable. "
+                    "Check Paystack before retrying."
+                ),
             }
 
-        except requests.RequestException as exc:
+        except requests.RequestException:
             return {
                 "status": False,
-                "message": f"Unable to connect to Paystack: {exc}",
+                "outcome": "unknown",
+                "message": (
+                    "Refund confirmation is unavailable. "
+                    "Check Paystack before retrying."
+                ),
             }

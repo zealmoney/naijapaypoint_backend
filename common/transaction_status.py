@@ -122,3 +122,29 @@ def classify_vtpass_response(response):
     # unknown responses must not trigger
     # automatic refunds.
     return "pending"
+
+def sanitize_vtpass_response(provider_response):
+    """
+    Return a minimal VTPass response suitable
+    for database persistence.
+
+    Do not persist raw customer information,
+    provider messages, or fulfillment data.
+    """
+    if not isinstance(provider_response, dict):
+        return {
+            "result": "invalid_provider_response",
+        }
+
+    sanitized = {}
+
+    code = provider_response.get("code")
+
+    if code not in (None, ""):
+        sanitized["code"] = str(code)[:255]
+
+    sanitized["result"] = classify_vtpass_response(
+        provider_response
+    )
+
+    return sanitized

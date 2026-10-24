@@ -2,9 +2,12 @@ from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db.models import Q
+from django.utils import timezone
 
 from transactions.models import Transaction
 from transactions.serializers import TransactionSerializer
+
+from wallets.models import WalletTransaction
 
 from django.db import transaction as db_transaction
 from rest_framework import status
@@ -36,7 +39,29 @@ def serialize_registered_transaction(tx):
         "created_at": tx.created_at,
         "updated_at": tx.updated_at,
         "metadata": tx.metadata or {},
-        "can_refund": tx.status not in {"refunded"},
+        "can_refund": tx.status in {
+            "pending",
+            "processing",
+            "failed",
+        },
+        "can_resolve": (
+            tx.status not in {
+                "success",
+                "refunded",
+            }
+            and bool(
+                (tx.metadata or {}).get(
+                    "requires_manual_review",
+                    False,
+                )
+            )
+            and not bool(
+                (tx.metadata or {}).get(
+                    "admin_resolved",
+                    False,
+                )
+            )
+        ),
     }
 
 
@@ -254,93 +279,303 @@ class AdminTransactionRefundView(APIView):
     permission_classes = [IsAdminUser]
 
     def post(self, request, reference):
+        note = request.data.get("note", "").strip()
+
         try:
-            tx = Transaction.objects.select_related("user").get(reference=reference)
+            with db_transaction.atomic():
+                tx = (
+                    Transaction.objects
+                    .select_for_update()
+                    .select_related("user")
+                    .get(reference=reference)
+                )
+
+                if tx.status == "refunded":
+                    return Response(
+                        {
+                            "detail": (
+                                "Transaction has already been "
+                                "refunded."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                if tx.status != "failed":
+                    return Response(
+                        {
+                            "detail": (
+                                "Only failed transactions can "
+                                "be refunded."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                # Admin wallet refunds are only valid for
+                # service-purchase transactions that actually
+                # debited the customer's wallet.
+                original_debit = (
+                    WalletTransaction.objects
+                    .select_for_update()
+                    .filter(
+                        wallet=tx.user.wallet,
+                        transaction_type="debit",
+                        reference=tx.reference,
+                    )
+                    .first()
+                )
+
+                if original_debit is None:
+                    return Response(
+                        {
+                            "detail": (
+                                "Refund blocked because no matching "
+                                "original wallet debit was found."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                if original_debit.amount != tx.amount:
+                    return Response(
+                        {
+                            "detail": (
+                                "Refund blocked because the original "
+                                "wallet debit amount does not match "
+                                "the transaction amount."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                refund_reference = (
+                    f"ADMIN-REFUND-{tx.reference}"
+                )
+
+                existing_refund = (
+                    WalletTransaction.objects
+                    .filter(
+                        wallet=tx.user.wallet,
+                        transaction_type="credit",
+                        reference=refund_reference,
+                    )
+                    .first()
+                )
+
+                if existing_refund is not None:
+                    return Response(
+                        {
+                            "detail": (
+                                "A refund already exists for this "
+                                "transaction."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                WalletService.credit_wallet(
+                    wallet=tx.user.wallet,
+                    amount=tx.amount,
+                    reference=refund_reference,
+                    description=(
+                        "Admin refund for transaction "
+                        f"{tx.reference}"
+                    ),
+                )
+
+                tx.status = "refunded"
+                tx.metadata = {
+                    **(tx.metadata or {}),
+                    "admin_refund": True,
+                    "refund_reference": refund_reference,
+                    "admin_note": note,
+                }
+                tx.save(
+                    update_fields=[
+                        "status",
+                        "metadata",
+                    ]
+                )
+
+                NotificationService.create_notification(
+                    user=tx.user,
+                    notification_type="refund",
+                    title="Transaction Refunded",
+                    message=(
+                        f"₦{tx.amount} has been refunded "
+                        f"for transaction {tx.reference}."
+                    ),
+                    metadata={
+                        "reference": tx.reference,
+                        "refund_reference":
+                            refund_reference,
+                        "amount": str(tx.amount),
+                    },
+                )
+
+                AuditLogService.log_action(
+                    admin_user=request.user,
+                    action_type="refund_transaction",
+                    target_user_email=tx.user.email,
+                    target_reference=tx.reference,
+                    note=note,
+                    metadata={
+                        "amount": str(tx.amount),
+                        "refund_reference":
+                            refund_reference,
+                        "service_type":
+                            tx.service_type,
+                    },
+                )
+
         except Transaction.DoesNotExist:
-            return Response({"detail": "Transaction not found."}, status=404)
-
-        if tx.status == "refunded":
             return Response(
-                {"detail": "Transaction already refunded."},
-                status=status.HTTP_400_BAD_REQUEST,
+                {"detail": "Transaction not found."},
+                status=status.HTTP_404_NOT_FOUND,
             )
 
-        refund_reference = f"ADMIN-REFUND-{tx.reference}"
-
-        with db_transaction.atomic():
-            WalletService.credit_wallet(
-                wallet=tx.user.wallet,
-                amount=tx.amount,
-                reference=refund_reference,
-                description=f"Admin refund for transaction {tx.reference}",
-            )
-
-            tx.status = "refunded"
-            tx.metadata = {
-                **(tx.metadata or {}),
-                "admin_refund": True,
-                "refund_reference": refund_reference,
-                "admin_note": request.data.get("note", ""),
+        return Response(
+            {
+                "detail":
+                    "Transaction refunded successfully."
             }
-            tx.save(update_fields=["status", "metadata"])
-
-            NotificationService.create_notification(
-                user=tx.user,
-                notification_type="refund",
-                title="Transaction Refunded",
-                message=f"₦{tx.amount} has been refunded for transaction {tx.reference}.",
-                metadata={
-                    "reference": tx.reference,
-                    "refund_reference": refund_reference,
-                    "amount": str(tx.amount),
-                },
-            )
-
-            AuditLogService.log_action(
-                admin_user=request.user,
-                action_type="refund_transaction",
-                target_user_email=tx.user.email,
-                target_reference=tx.reference,
-                note=request.data.get("note", ""),
-                metadata={
-                    "amount": str(tx.amount),
-                    "refund_reference": refund_reference,
-                    "service_type": tx.service_type,
-                },
-            )
-
-        return Response({"detail": "Transaction refunded successfully."})
-
+        )
 
 class AdminTransactionResolveView(APIView):
     permission_classes = [IsAdminUser]
 
     def post(self, request, reference):
+        note = request.data.get(
+            "note",
+            "",
+        ).strip()
+
+        if not note:
+            return Response(
+                {
+                    "detail": (
+                        "A resolution note is "
+                        "required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
-            tx = Transaction.objects.get(reference=reference)
+            with db_transaction.atomic():
+                tx = (
+                    Transaction.objects
+                    .select_for_update()
+                    .select_related("user")
+                    .get(reference=reference)
+                )
+
+                metadata = tx.metadata or {}
+
+                if tx.status in {
+                    "success",
+                    "refunded",
+                }:
+                    return Response(
+                        {
+                            "detail": (
+                                "Completed transactions "
+                                "cannot be marked as "
+                                "manually resolved."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                if not metadata.get(
+                    "requires_manual_review",
+                    False,
+                ):
+                    return Response(
+                        {
+                            "detail": (
+                                "This transaction does "
+                                "not require manual "
+                                "review."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                if metadata.get(
+                    "admin_resolved",
+                    False,
+                ):
+                    return Response(
+                        {
+                            "detail": (
+                                "This transaction has "
+                                "already been marked "
+                                "as resolved."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                resolved_at = (
+                    timezone.now().isoformat()
+                )
+
+                tx.metadata = {
+                    **metadata,
+                    "admin_resolved": True,
+                    "admin_resolved_at":
+                        resolved_at,
+                    "admin_resolved_by":
+                        request.user.email,
+                    "admin_resolution_note":
+                        note,
+                }
+
+                tx.save(
+                    update_fields=[
+                        "metadata",
+                    ]
+                )
+
+                AuditLogService.log_action(
+                    admin_user=request.user,
+                    action_type=(
+                        "resolve_transaction"
+                    ),
+                    target_user_email=tx.user.email,
+                    target_reference=tx.reference,
+                    note=note,
+                    metadata={
+                        "service_type":
+                            tx.service_type,
+                        "amount":
+                            str(tx.amount),
+                        "transaction_status":
+                            tx.status,
+                        "requires_manual_review":
+                            True,
+                    },
+                )
+
         except Transaction.DoesNotExist:
-            return Response({"detail": "Transaction not found."}, status=404)
+            return Response(
+                {
+                    "detail":
+                        "Transaction not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
-        tx.metadata = {
-            **(tx.metadata or {}),
-            "admin_resolved": True,
-            "admin_note": request.data.get("note", ""),
-        }
-        tx.save(update_fields=["metadata"])
-
-        AuditLogService.log_action(
-            admin_user=request.user,
-            action_type="resolve_transaction",
-            target_user_email=tx.user.email,
-            target_reference=tx.reference,
-            note=request.data.get("note", ""),
-            metadata={
-                "service_type": tx.service_type,
-                "amount": str(tx.amount),
-            },
+        return Response(
+            {
+                "detail": (
+                    "Manual review marked as "
+                    "resolved."
+                )
+            }
         )
-
-        return Response({"detail": "Transaction marked as resolved."})
 
 class AdminGuestTransactionRefundView(APIView):
     permission_classes = [IsAdminUser]
@@ -369,9 +604,10 @@ class AdminGuestTransactionRefundView(APIView):
                     )
 
                 if guest_tx.status in {
-                    "refund_pending",
-                    "refunded",
-                }:
+                      "refund_pending",
+                      "refund_failed",
+                      "refunded",
+                  }:
                     return Response(
                         {
                             "detail": (
@@ -417,47 +653,133 @@ class AdminGuestTransactionRefundView(APIView):
             )
 
             if not refund_response.get("status"):
-                guest_tx.status = "refund_failed"
-                guest_tx.refund_status = "failed"
-                guest_tx.refund_response = refund_response
-                guest_tx.save(
-                    update_fields=[
-                        "status",
-                        "refund_status",
-                        "refund_response",
-                    ]
-                )
+                with database_transaction.atomic():
+                    guest_tx = (
+                        GuestTransaction.objects
+                        .select_for_update()
+                        .get(pk=guest_tx.pk)
+                    )
+
+                    # A webhook may have completed the refund
+                    # before the API request returned.
+                    if guest_tx.status == "refunded":
+                        return Response(
+                            {
+                                "detail": "Guest refund already completed.",
+                                "transaction_reference": guest_tx.reference,
+                                "refund_status": guest_tx.refund_status,
+                                "refund_reference": guest_tx.refund_reference,
+                            },
+                            status=status.HTTP_200_OK,
+                        )
+
+                    if guest_tx.status != "refund_pending":
+                        return Response(
+                            {
+                                "detail": (
+                                    "Refund state changed. "
+                                    "Manual review is required."
+                                ),
+                            },
+                            status=status.HTTP_409_CONFLICT,
+                        )
+
+                    if refund_response.get("outcome") == "unknown":
+                        guest_tx.status = "refund_pending"
+                        guest_tx.refund_status = "manual_review"
+                    else:
+                        guest_tx.status = "refund_failed"
+                        guest_tx.refund_status = "failed"
+
+                    guest_tx.refund_response = {
+                        "outcome": (
+                            "unknown"
+                            if refund_response.get("outcome") == "unknown"
+                            else "failed"
+                        )
+                    }
+
+                    guest_tx.save(
+                        update_fields=[
+                            "status",
+                            "refund_status",
+                            "refund_response",
+                        ]
+                    )
 
                 return Response(
                     {
-                        "detail": refund_response.get(
-                            "message",
-                            "Unable to initiate Paystack refund.",
+                        "detail": (
+                            "Refund confirmation is unavailable. "
+                            "Check Paystack before taking further action."
+                            if refund_response.get("outcome") == "unknown"
+                            else "Paystack could not initiate the refund."
                         ),
-                        "refund_response": refund_response,
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
             refund_data = refund_response.get("data") or {}
 
-            guest_tx.status = "refund_pending"
-            guest_tx.refund_status = (
-                refund_data.get("status") or "pending"
-            )
-            guest_tx.refund_reference = str(
-                refund_data.get("id") or ""
-            )
-            guest_tx.refund_response = refund_response
+            # Reacquire the database lock after Paystack responds.
+            # The webhook may have completed the refund meanwhile.
+            with database_transaction.atomic():
+                guest_tx = (
+                    GuestTransaction.objects
+                    .select_for_update()
+                    .get(pk=guest_tx.pk)
+                )
 
-            guest_tx.save(
-                update_fields=[
-                    "status",
-                    "refund_status",
-                    "refund_reference",
-                    "refund_response",
-                ]
-            )
+                if guest_tx.status == "refunded":
+                    return Response(
+                        {
+                            "detail": "Guest refund already completed.",
+                            "transaction_reference": guest_tx.reference,
+                            "refund_status": guest_tx.refund_status,
+                            "refund_reference": guest_tx.refund_reference,
+                        },
+                        status=status.HTTP_200_OK,
+                    )
+
+                if guest_tx.status != "refund_pending":
+                    return Response(
+                        {
+                            "detail": (
+                                "Refund state changed while Paystack "
+                                "was processing the request. "
+                                "Manual review is required."
+                            ),
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                guest_tx.status = "refund_pending"
+                guest_tx.refund_status = (
+                    refund_data.get("status") or "pending"
+                )
+                guest_tx.refund_reference = str(
+                    refund_data.get("id") or ""
+                )
+                # Retain only the information needed for reconciliation.
+                # Never persist the full Paystack response.
+                guest_tx.refund_response = {
+                    "result": "initiated",
+                    "refund_reference": str(
+                        refund_data.get("id") or ""
+                    ),
+                    "refund_status": str(
+                        refund_data.get("status") or "pending"
+                    ),
+                }
+
+                guest_tx.save(
+                    update_fields=[
+                        "status",
+                        "refund_status",
+                        "refund_reference",
+                        "refund_response",
+                    ]
+                )
 
             AuditLogService.log_action(
                 admin_user=request.user,
@@ -493,11 +815,14 @@ class AdminGuestTransactionRefundView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        except Exception as exc:
+        except Exception:
             return Response(
                 {
-                    "detail": "Unable to process guest refund.",
-                    "error": str(exc),
+                    "detail": (
+                        "Unable to process guest refund. "
+                        "Check the transaction and Paystack refund status "
+                        "before attempting another action."
+                    ),
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )

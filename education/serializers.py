@@ -1,17 +1,23 @@
 from rest_framework import serializers
 from .models import EducationTransaction
 
+EDUCATION_PROVIDER_CHOICES = (
+    ("waec", "WAEC Result Checker"),
+    ("waec-registration", "WAEC Registration"),
+    ("neco", "NECO Token"),
+    ("jamb", "JAMB"),
+)
 
 class EducationPlansSerializer(serializers.Serializer):
-    provider = serializers.CharField(max_length=100)
+    provider = serializers.ChoiceField(
+        choices=EDUCATION_PROVIDER_CHOICES
+    )
 
 
 class EducationPurchaseSerializer(serializers.Serializer):
-    provider = serializers.CharField(max_length=100)
+    provider = serializers.ChoiceField(choices=EDUCATION_PROVIDER_CHOICES)
     plan_id = serializers.CharField(max_length=100)
-    plan_name = serializers.CharField(max_length=255)
-    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
-    quantity = serializers.IntegerField(default=1)
+    quantity = serializers.IntegerField(default=1, min_value=1, max_value=10)
 
     phone_number = serializers.CharField(
         max_length=20,
@@ -35,10 +41,34 @@ class EducationPurchaseSerializer(serializers.Serializer):
                     "JAMB Profile ID is required."
             })
 
+        if (
+            attrs.get("provider") == "jamb"
+            and attrs.get("quantity", 1) != 1
+        ):
+            raise serializers.ValidationError({
+                "quantity":
+                    "JAMB purchases must have "
+                    "a quantity of 1."
+            })
+
         return attrs
 
 
-class EducationTransactionSerializer(serializers.ModelSerializer):
+class EducationTransactionSerializer(
+    serializers.ModelSerializer
+):
     class Meta:
         model = EducationTransaction
-        fields = "__all__"
+        fields = [
+            "id",
+            "provider",
+            "plan_id",
+            "plan_name",
+            "amount",
+            "quantity",
+            "phone_number",
+            "pin",
+            "reference",
+            "status",
+            "created_at",
+        ]

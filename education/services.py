@@ -16,10 +16,6 @@ class VTPassEducationService:
     def _post(cls, path, payload):
         url = f"{settings.VTPASS_BASE_URL}{path}"
 
-        print("========== VTPASS EDUCATION ==========")
-        print("URL:", url)
-        print("PAYLOAD:", payload)
-
         try:
             response = requests.post(
                 url,
@@ -27,9 +23,6 @@ class VTPassEducationService:
                 headers=cls._headers(),
                 timeout=30,
             )
-
-            print("VTPASS STATUS:", response.status_code)
-            print("VTPASS RAW RESPONSE:", response.text)
 
             try:
                 return response.json()
@@ -79,16 +72,6 @@ class VTPassEducationService:
                 },
                 headers=cls._headers(),
                 timeout=30,
-            )
-
-            print(
-                "EDUCATION PLANS STATUS:",
-                response.status_code,
-            )
-
-            print(
-                "EDUCATION PLANS RESPONSE:",
-                response.text,
             )
 
             try:

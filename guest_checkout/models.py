@@ -40,6 +40,14 @@ class GuestTransaction(models.Model):
 
     reference = models.CharField(max_length=100, unique=True)
 
+    receipt_access_token = models.CharField(
+        max_length=64,
+        unique=True,
+        null=True,
+        blank=True,
+        editable=False,
+    )
+
     payment_reference = models.CharField(max_length=100, blank=True)
     authorization_url = models.URLField(blank=True)
 

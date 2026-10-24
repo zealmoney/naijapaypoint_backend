@@ -69,19 +69,110 @@ class AdminTransactionUpdateStatusView(APIView):
 
     def post(self, request, reference):
         new_status = request.data.get("status")
-        note = request.data.get("note", "")
+        note = request.data.get("note", "").strip()
 
-        allowed_statuses = ["pending", "success", "failed", "refunded"]
+        # This generic admin endpoint must never be used
+        # to manufacture provider success or perform a
+        # financial refund.
+        allowed_admin_statuses = [
+            "pending",
+            "failed",
+        ]
 
-        if new_status not in allowed_statuses:
-            return Response({"detail": "Invalid status."}, status=400)
+        if new_status not in allowed_admin_statuses:
+            return Response(
+                {
+                    "detail": (
+                        "This status cannot be set manually. "
+                        "Success must be confirmed through the "
+                        "provider/reconciliation workflow, and "
+                        "refunds must use the refund workflow."
+                    )
+                },
+                status=400,
+            )
 
         try:
-            tx = Transaction.objects.select_related("user").get(reference=reference)
+            tx = Transaction.objects.select_related(
+                "user"
+            ).get(
+                reference=reference
+            )
         except Transaction.DoesNotExist:
-            return Response({"detail": "Transaction not found."}, status=404)
+            return Response(
+                {
+                    "detail":
+                        "Transaction not found."
+                },
+                status=404,
+            )
 
         old_status = tx.status
+
+        # Terminal financial/provider states must not be
+        # reopened or rewritten through this endpoint.
+        if old_status in {
+            "success",
+            "refunded",
+        }:
+            return Response(
+                {
+                    "detail": (
+                        "A successful or refunded "
+                        "transaction cannot be changed "
+                        "manually."
+                    )
+                },
+                status=409,
+            )
+
+        # Avoid pretending that an administrative action
+        # occurred when nothing actually changed.
+        if new_status == old_status:
+            return Response(
+                {
+                    "detail": (
+                        "Transaction already has "
+                        f"status '{old_status}'."
+                    )
+                },
+                status=400,
+            )
+
+        # The only meaningful transition currently allowed
+        # by this endpoint is an unresolved transaction
+        # being administratively marked failed.
+        if new_status == "failed" and old_status not in {
+            "pending",
+            "processing",
+        }:
+            return Response(
+                {
+                    "detail": (
+                        "Only pending or processing "
+                        "transactions can be marked failed "
+                        "manually."
+                    )
+                },
+                status=409,
+            )
+
+        # There is currently no valid transition *to*
+        # pending through this endpoint. Keeping "pending"
+        # in the input allowlist above gives us an explicit,
+        # controlled rejection rather than silently allowing
+        # arbitrary state rewrites.
+        if new_status == "pending":
+            return Response(
+                {
+                    "detail": (
+                        "Transactions cannot be moved back "
+                        "to pending manually."
+                    )
+                },
+                status=409,
+            )
+
         tx.status = new_status
         tx.metadata = {
             **(tx.metadata or {}),
@@ -90,7 +181,13 @@ class AdminTransactionUpdateStatusView(APIView):
             "new_status": new_status,
             "admin_status_note": note,
         }
-        tx.save(update_fields=["status", "metadata"])
+
+        tx.save(
+            update_fields=[
+                "status",
+                "metadata",
+            ]
+        )
 
         AuditLogService.log_action(
             admin_user=request.user,
@@ -106,57 +203,42 @@ class AdminTransactionUpdateStatusView(APIView):
             },
         )
 
-        return Response({
-            "detail": "Transaction status updated.",
-            "old_status": old_status,
-            "new_status": new_status,
-        })
-
+        return Response(
+            {
+                "detail":
+                    "Transaction status updated.",
+                "old_status": old_status,
+                "new_status": new_status,
+            }
+        )
 
 class AdminTransactionUpdateProviderRefView(APIView):
     permission_classes = [IsAdminUser]
 
     def post(self, request, reference):
-        provider_reference = request.data.get("provider_reference", "").strip()
-        note = request.data.get("note", "")
-
-        if not provider_reference:
+        try:
+            tx = Transaction.objects.select_related(
+                "user"
+            ).get(
+                reference=reference
+            )
+        except Transaction.DoesNotExist:
             return Response(
-                {"detail": "Provider reference is required."},
-                status=400,
+                {
+                    "detail":
+                        "Transaction not found."
+                },
+                status=404,
             )
 
-        try:
-            tx = Transaction.objects.select_related("user").get(reference=reference)
-        except Transaction.DoesNotExist:
-            return Response({"detail": "Transaction not found."}, status=404)
-
-        old_provider_reference = tx.provider_reference
-
-        tx.provider_reference = provider_reference
-        tx.metadata = {
-            **(tx.metadata or {}),
-            "admin_provider_reference_update": True,
-            "previous_provider_reference": old_provider_reference,
-            "new_provider_reference": provider_reference,
-            "admin_provider_note": note,
-        }
-        tx.save(update_fields=["provider_reference", "metadata"])
-
-        AuditLogService.log_action(
-            admin_user=request.user,
-            action_type="provider_reference_updated",
-            target_user_email=tx.user.email,
-            target_reference=tx.reference,
-            note=note,
-            metadata={
-                "old_provider_reference": old_provider_reference,
-                "new_provider_reference": provider_reference,
-                "service_type": tx.service_type,
+        return Response(
+            {
+                "detail": (
+                    "Provider references cannot be "
+                    "modified manually. They are "
+                    "controlled by provider and "
+                    "reconciliation workflows."
+                )
             },
+            status=409,
         )
-
-        return Response({
-            "detail": "Provider reference updated.",
-            "provider_reference": provider_reference,
-        })

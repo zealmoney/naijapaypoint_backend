@@ -218,14 +218,13 @@ class Command(BaseCommand):
                         tx.reference
                     )
                 )
-            except Exception as exc:
+            except Exception:
                 counters["errors"] += 1
 
                 self.stderr.write(
                     self.style.ERROR(
                         f"{tx.reference}: "
-                        f"requery exception: "
-                        f"{exc}"
+                        "provider requery failed."
                     )
                 )
 
@@ -242,24 +241,12 @@ class Command(BaseCommand):
                 "N/A",
             )
 
-            provider_description = (
-                provider_response.get(
-                    "response_description",
-                    "N/A",
-                )
-            )
-
             self.stdout.write(
                 f"Provider result: {result}"
             )
 
             self.stdout.write(
                 f"Provider code: {provider_code}"
-            )
-
-            self.stdout.write(
-                f"Provider description: "
-                f"{provider_description}"
             )
 
             if dry_run:
@@ -297,14 +284,14 @@ class Command(BaseCommand):
 
                     counters["skipped"] += 1
 
-                except Exception as exc:
+                except Exception:
                     counters["errors"] += 1
 
                     self.stderr.write(
                         self.style.ERROR(
                             f"{tx.reference}: "
-                            "manual-review marking "
-                            f"failed: {exc}"
+                            "manual-review marking failed. "
+                            "Internal error details withheld."
                         )
                     )
 
@@ -353,14 +340,14 @@ class Command(BaseCommand):
                     else:
                         counters["skipped"] += 1
 
-            except Exception as exc:
+            except Exception:
                 counters["errors"] += 1
 
                 self.stderr.write(
                     self.style.ERROR(
                         f"{tx.reference}: "
-                        f"reconciliation failed: "
-                        f"{exc}"
+                        "reconciliation failed. "
+                        "Internal error details withheld."
                     )
                 )
 
@@ -433,7 +420,9 @@ class Command(BaseCommand):
         main_tx.metadata = {
             **(main_tx.metadata or {}),
             "provider_response":
-                provider_response,
+                self._sanitize_provider_response(
+                    provider_response
+                ),
             "requires_requery": False,
             "reconciled": True,
             "reconciled_at":
@@ -506,7 +495,9 @@ class Command(BaseCommand):
         main_tx.metadata = {
             **metadata,
             "provider_response":
-                provider_response,
+                self._sanitize_provider_response(
+                    provider_response
+                ),
             "provider_result":
                 "manual_review",
             "requires_requery":
@@ -591,22 +582,25 @@ class Command(BaseCommand):
             )
 
             main_tx.metadata = {
-                **(main_tx.metadata or {}),
+                **metadata,
                 "provider_response":
-                    provider_response,
+                    self._sanitize_provider_response(
+                        provider_response
+                    ),
                 "requires_requery": False,
-                "requires_manual_review": False,
+                "requires_manual_review": True,
                 "reconciled": True,
                 "reconciled_at":
                     timezone.now().isoformat(),
                 "reconciliation_result":
-                    "refunded",
-                "requery_attempts": (
-                    main_tx.metadata or {}
-                ).get(
-                    "requery_attempts",
-                    0,
-                ),
+                    "manual_review",
+                "reconciliation_reason":
+                    "original_wallet_debit_not_found",
+                "requery_attempts":
+                    metadata.get(
+                        "requery_attempts",
+                        0,
+                    ),
             }
 
             main_tx.save(
@@ -660,7 +654,9 @@ class Command(BaseCommand):
         main_tx.metadata = {
             **(main_tx.metadata or {}),
             "provider_response":
-                provider_response,
+                self._sanitize_provider_response(
+                    provider_response
+                ),
             "requires_requery": False,
             "reconciled": True,
             "reconciled_at":
@@ -759,7 +755,9 @@ class Command(BaseCommand):
                 "checked_at":
                     now.isoformat(),
                 "response":
-                    provider_response,
+                    self._sanitize_provider_response(
+                        provider_response
+                    ),
             }
         )
 
@@ -770,7 +768,9 @@ class Command(BaseCommand):
             main_tx.metadata = {
                 **metadata,
                 "provider_response":
-                    provider_response,
+                    self._sanitize_provider_response(
+                        provider_response
+                    ),
                 "requires_requery": False,
                 "requires_manual_review":
                     True,
@@ -825,7 +825,9 @@ class Command(BaseCommand):
         main_tx.metadata = {
             **metadata,
             "provider_response":
-                provider_response,
+                self._sanitize_provider_response(
+                    provider_response
+                ),
             "requires_requery": True,
             "requires_manual_review":
                 False,
@@ -937,7 +939,9 @@ class Command(BaseCommand):
             "provider_response",
         ):
             service_tx.provider_response = (
-                provider_response
+                self._sanitize_provider_response(
+                    provider_response
+                )
             )
             update_fields.append(
                 "provider_response"
@@ -1015,7 +1019,9 @@ class Command(BaseCommand):
             "provider_response",
         ):
             service_tx.provider_response = (
-                provider_response
+                self._sanitize_provider_response(
+                    provider_response
+                )
             )
             update_fields.append(
                 "provider_response"
@@ -1030,6 +1036,48 @@ class Command(BaseCommand):
                 )
             )
 
+    @staticmethod
+    def _sanitize_provider_response(
+        provider_response,
+    ):
+        """
+        Return a minimal provider snapshot safe
+        for persistence and reconciliation audit.
+
+        Raw provider payloads may contain customer
+        or fulfillment data and must not be stored
+        in transaction metadata/history.
+        """
+        if not isinstance(
+            provider_response,
+            dict,
+        ):
+            return {
+                "result":
+                    "invalid_provider_response",
+            }
+
+        sanitized = {}
+
+        for key in (
+            "code",
+        ):
+            value = provider_response.get(key)
+
+            if value not in (
+                None,
+                "",
+            ):
+                sanitized[key] = str(value)[:255]
+
+        sanitized["result"] = (
+            classify_vtpass_response(
+                provider_response
+            )
+        )
+
+        return sanitized
+
     def _save_provider_response(
         self,
         service_tx,
@@ -1042,7 +1090,9 @@ class Command(BaseCommand):
             return
 
         service_tx.provider_response = (
-            provider_response
+            self._sanitize_provider_response(
+                provider_response
+            )
         )
 
         service_tx.save(

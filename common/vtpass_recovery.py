@@ -34,7 +34,6 @@ class VTPassRecoveryService:
                     "response_description":
                         "VTPass returned an invalid requery response.",
                     "http_status": response.status_code,
-                    "raw_response": response.text,
                 }
 
             return data
@@ -46,9 +45,9 @@ class VTPassRecoveryService:
                     "VTPass requery timed out.",
             }
 
-        except requests.RequestException as exc:
+        except requests.RequestException:
             return {
                 "code": "REQUERY_CONNECTION_ERROR",
                 "response_description":
-                    f"Unable to connect to VTPass: {exc}",
+                    "Unable to connect to VTPass.",
             }

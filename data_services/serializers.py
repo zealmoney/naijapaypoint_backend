@@ -1,13 +1,27 @@
 from rest_framework import serializers
 from .models import DataTransaction
 
+DATA_NETWORK_CHOICES = (
+    ("mtn-data", "MTN"),
+    ("airtel-data", "Airtel"),
+    ("glo-data", "Glo"),
+    ("etisalat-data", "9mobile"),
+)
+
 
 class DataPurchaseSerializer(serializers.Serializer):
-    network = serializers.CharField(max_length=20)
-    phone_number = serializers.CharField(max_length=20)
-    plan_id = serializers.CharField(max_length=100)
-    plan_name = serializers.CharField(max_length=255)
-    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    network = serializers.ChoiceField(
+        choices=DATA_NETWORK_CHOICES
+    )
+    phone_number = serializers.CharField(
+        max_length=20
+    )
+    plan_id = serializers.CharField(
+        max_length=100
+    )
+
+class DataPlansSerializer(serializers.Serializer):
+    network = serializers.ChoiceField(choices=DATA_NETWORK_CHOICES)
 
 
 class DataTransactionSerializer(serializers.ModelSerializer):
@@ -23,6 +37,5 @@ class DataTransactionSerializer(serializers.ModelSerializer):
             "reference",
             "status",
             "provider",
-            "provider_response",
             "created_at",
         ]

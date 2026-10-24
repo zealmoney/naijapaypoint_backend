@@ -267,6 +267,13 @@ CORS_ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
+from corsheaders.defaults import default_headers
+
+CORS_ALLOW_HEADERS = (
+    *default_headers,
+    "x-guest-receipt-token",
+)
+
 # ---------------------------------------------------------
 # Production security
 # ---------------------------------------------------------

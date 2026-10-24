@@ -6,6 +6,7 @@ from rest_framework.views import APIView
 
 from transactions.models import Transaction
 from wallets.services import WalletService
+from wallets.models import WalletTransaction
 
 from .models import ElectricityTransaction
 from .serializers import (
@@ -19,6 +20,7 @@ from notifications.services import NotificationService
 
 from common.transaction_status import (
     classify_vtpass_response,
+    sanitize_vtpass_response,
 )
 from common.vtpass_request_id import (
     generate_vtpass_request_id,
@@ -70,31 +72,259 @@ class VerifyMeterView(APIView):
             raise_exception=True
         )
 
-        response = (
-            VTPassElectricityService.verify_meter(
-                service_id=(
-                    serializer.validated_data[
-                        "provider"
-                    ]
-                ),
-                billers_code=(
+        try:
+            provider_response = (
+                VTPassElectricityService.verify_meter(
+                    service_id=(
+                        serializer.validated_data[
+                            "provider"
+                        ]
+                    ),
+                    billers_code=(
+                        serializer.validated_data[
+                            "meter_number"
+                        ]
+                    ),
+                    meter_type=(
+                        serializer.validated_data[
+                            "meter_type"
+                        ]
+                    ),
+                )
+            )
+        except Exception:
+            return Response(
+                {
+                    "detail": (
+                        "Meter verification could not "
+                        "be completed at this time."
+                    )
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        if not isinstance(
+            provider_response,
+            dict,
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Meter verification could not "
+                        "be completed at this time."
+                    )
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        code = str(
+            provider_response.get(
+                "code",
+                "",
+            )
+        ).strip()
+
+        content = provider_response.get(
+            "content",
+            {},
+        )
+
+        if not isinstance(content, dict):
+            content = {}
+
+        customer_name = (
+            content.get("Customer_Name")
+            or content.get("customer_name")
+            or content.get("CustomerName")
+            or provider_response.get(
+                "Customer_Name"
+            )
+            or provider_response.get(
+                "customer_name"
+            )
+            or ""
+        )
+
+        customer_name = str(
+            customer_name
+        ).strip()
+
+        if code != "000" or not customer_name:
+            return Response(
+                {
+                    "detail": (
+                        "Meter verification failed. "
+                        "Please check the meter "
+                        "details and try again."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            {
+                "verified": True,
+                "customer_name": customer_name,
+                "meter_number": (
                     serializer.validated_data[
                         "meter_number"
                     ]
                 ),
-                meter_type=(
+                "meter_type": (
                     serializer.validated_data[
                         "meter_type"
                     ]
                 ),
-            )
+                "provider": (
+                    serializer.validated_data[
+                        "provider"
+                    ]
+                ),
+            },
+            status=status.HTTP_200_OK,
         )
-
-        return Response(response)
 
 
 class ElectricityPurchaseView(APIView):
     permission_classes = [IsAuthenticated]
+
+    @staticmethod
+    def _refund_pending_transaction(
+        *,
+        electricity_tx,
+        main_tx,
+        amount,
+        reference,
+        provider_response,
+        refund_message,
+    ):
+        with transaction.atomic():
+            electricity_tx = (
+                ElectricityTransaction.objects
+                .select_for_update()
+                .get(pk=electricity_tx.pk)
+            )
+
+            main_tx = (
+                Transaction.objects
+                .select_for_update()
+                .get(pk=main_tx.pk)
+            )
+
+            if (
+                electricity_tx.status != "pending"
+                or main_tx.status != "pending"
+            ):
+                return (
+                    electricity_tx,
+                    main_tx,
+                    False,
+                )
+
+            original_debit_exists = (
+                WalletTransaction.objects.filter(
+                    wallet__user=electricity_tx.user,
+                    reference=reference,
+                    transaction_type="debit",
+                    amount=amount,
+                ).exists()
+            )
+
+            if not original_debit_exists:
+                return (
+                    electricity_tx,
+                    main_tx,
+                    False,
+                )
+
+            refund_reference = (
+                f"REFUND-{reference}"
+            )
+
+            WalletService.credit_wallet(
+                wallet=electricity_tx.user.wallet,
+                amount=amount,
+                reference=refund_reference,
+                description=refund_message,
+            )
+
+            electricity_tx.status = "refunded"
+            electricity_tx.provider_response = (
+                provider_response
+            )
+            electricity_tx.save(
+                update_fields=[
+                    "status",
+                    "provider_response",
+                ]
+            )
+
+            main_tx.status = "refunded"
+            main_tx.metadata = {
+                **(main_tx.metadata or {}),
+                "refund_reference":
+                    refund_reference,
+                "requires_requery": False,
+                "requires_manual_review":
+                    False,
+            }
+            main_tx.save(
+                update_fields=[
+                    "status",
+                    "metadata",
+                ]
+            )
+
+        return (
+            electricity_tx,
+            main_tx,
+            True,
+        )
+
+    @staticmethod
+    def _mark_pending_transaction_success(
+        *,
+        electricity_tx,
+        main_tx,
+    ):
+        with transaction.atomic():
+            electricity_tx = (
+                ElectricityTransaction.objects
+                .select_for_update()
+                .get(pk=electricity_tx.pk)
+            )
+
+            main_tx = (
+                Transaction.objects
+                .select_for_update()
+                .get(pk=main_tx.pk)
+            )
+
+            if (
+                electricity_tx.status != "pending"
+                or main_tx.status != "pending"
+            ):
+                return (
+                    electricity_tx,
+                    main_tx,
+                    False,
+                )
+
+            electricity_tx.status = "success"
+            electricity_tx.save(
+                update_fields=["status"]
+            )
+
+            main_tx.status = "success"
+            main_tx.save(
+                update_fields=["status"]
+            )
+
+        return (
+            electricity_tx,
+            main_tx,
+            True,
+        )
 
     def post(self, request):
         serializer = (
@@ -199,25 +429,16 @@ class ElectricityPurchaseView(APIView):
                 )
             )
 
-            print(
-                "VTPASS ELECTRICITY "
-                "PURCHASE RESPONSE:",
-                provider_response,
-                flush=True,
-            )
-
-        except Exception as error:
-            print(
-                "VTPASS ELECTRICITY EXCEPTION:",
-                str(error),
-                flush=True,
-            )
-
+        except Exception:
             # Do not automatically refund a
             # network/provider exception.
             # VTPass may have processed the vend.
+            #
+            # Keep the transaction pending because
+            # the provider may still have processed
+            # the vend. Do not persist raw exception
+            # details.
             provider_response = {
-                "error": str(error),
                 "response_description": (
                     "Provider request failed"
                 ),
@@ -233,14 +454,15 @@ class ElectricityPurchaseView(APIView):
             )
         )
 
-        print(
-            "VTPASS ELECTRICITY RESULT:",
-            provider_result,
-            flush=True,
+        # Retain the original response temporarily
+        # for electricity token and reference extraction.
+        # Persist only allowlisted provider information.
+        sanitized_response = sanitize_vtpass_response(
+            provider_response
         )
 
         electricity_tx.provider_response = (
-            provider_response
+            sanitized_response
         )
         electricity_tx.save(
             update_fields=[
@@ -251,7 +473,7 @@ class ElectricityPurchaseView(APIView):
         main_tx.metadata = {
             **(main_tx.metadata or {}),
             "provider_response":
-                provider_response,
+                sanitized_response,
             "provider_result":
                 provider_result,
         }
@@ -294,25 +516,46 @@ class ElectricityPurchaseView(APIView):
                 provider_response
             )
 
-            electricity_tx.status = "success"
+            (
+                electricity_tx,
+                main_tx,
+                marked_success,
+            ) = self._mark_pending_transaction_success(
+                electricity_tx=electricity_tx,
+                main_tx=main_tx,
+            )
+
+            if not marked_success:
+                return Response(
+                    {
+                        "detail": (
+                            "Electricity transaction "
+                            "state changed before the "
+                            "success result could be "
+                            "applied."
+                        ),
+                        "reference": reference,
+                        "status": electricity_tx.status,
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
             electricity_tx.token = token
             electricity_tx.provider_response = (
-                provider_response
+                sanitized_response
             )
             electricity_tx.save(
                 update_fields=[
-                    "status",
                     "token",
                     "provider_response",
                 ]
             )
 
-            main_tx.status = "success"
             main_tx.metadata = {
                 **(main_tx.metadata or {}),
                 "token": token,
                 "provider_response":
-                    provider_response,
+                    sanitized_response,
                 "provider_result":
                     provider_result,
                 "requires_requery": False,
@@ -386,8 +629,6 @@ class ElectricityPurchaseView(APIView):
                     "status": "pending",
                     "provider_result":
                         provider_result,
-                    "provider_response":
-                        provider_response,
                     "transaction":
                         ElectricityTransactionSerializer(
                             electricity_tx
@@ -430,8 +671,6 @@ class ElectricityPurchaseView(APIView):
                     "status": "manual_review",
                     "provider_result":
                         provider_result,
-                    "provider_response":
-                        provider_response,
                     "transaction":
                         ElectricityTransactionSerializer(
                             electricity_tx
@@ -449,69 +688,59 @@ class ElectricityPurchaseView(APIView):
         # this point and are safe to refund.
         # -----------------------------------------
 
+        (
+            electricity_tx,
+            main_tx,
+            refunded,
+        ) = self._refund_pending_transaction(
+            electricity_tx=electricity_tx,
+            main_tx=main_tx,
+            amount=amount,
+            reference=reference,
+            provider_response=sanitized_response,
+            refund_message=(
+                "Refund for failed "
+                "electricity purchase"
+            ),
+        )
+
+        if not refunded:
+            return Response(
+                {
+                    "detail": (
+                        "Electricity transaction "
+                        "state changed before the "
+                        "refund could be applied. "
+                        "No duplicate refund was "
+                        "issued."
+                    ),
+                    "reference": reference,
+                    "status": electricity_tx.status,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
         refund_reference = (
             f"REFUND-{reference}"
         )
 
-        with transaction.atomic():
-            WalletService.credit_wallet(
-                wallet=request.user.wallet,
-                amount=amount,
-                reference=refund_reference,
-                description=(
-                    "Refund for failed "
-                    "electricity purchase"
-                ),
-            )
-
-            electricity_tx.status = "refunded"
-            electricity_tx.provider_response = (
-                provider_response
-            )
-            electricity_tx.save(
-                update_fields=[
-                    "status",
-                    "provider_response",
-                ]
-            )
-
-            main_tx.status = "refunded"
-            main_tx.metadata = {
-                **(main_tx.metadata or {}),
-                "provider_response":
-                    provider_response,
-                "provider_result":
-                    provider_result,
+        NotificationService.create_notification(
+            user=request.user,
+            notification_type="refund",
+            title="Wallet Refunded",
+            message=(
+                f"₦{amount} has been "
+                "refunded to your wallet."
+            ),
+            metadata={
+                "reference": reference,
                 "refund_reference":
                     refund_reference,
-                "requires_requery": False,
-                "requires_manual_review":
-                    False,
-            }
-            main_tx.save(
-                update_fields=[
-                    "status",
-                    "metadata",
-                ]
-            )
-
-            NotificationService.create_notification(
-                user=request.user,
-                notification_type="refund",
-                title="Wallet Refunded",
-                message=(
-                    f"₦{amount} has been "
-                    "refunded to your wallet."
-                ),
-                metadata={
-                    "reference": reference,
-                    "refund_reference":
-                        refund_reference,
-                    "service_type":
-                        "electricity",
-                    "amount": str(amount),
-                },
-            )
+                "service_type":
+                    "electricity",
+                "amount": str(amount),
+            },
+        )
 
         return Response(
             {
@@ -521,8 +750,6 @@ class ElectricityPurchaseView(APIView):
                 ),
                 "provider_result":
                     provider_result,
-                "provider_response":
-                    provider_response,
                 "transaction":
                     ElectricityTransactionSerializer(
                         electricity_tx

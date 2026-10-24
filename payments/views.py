@@ -1,5 +1,5 @@
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 from django.utils import timezone
@@ -157,51 +157,108 @@ def award_referral_bonus_if_eligible(user):
     return True
 
 def ensure_wallet_funding_transaction(payment, user):
-    transaction, created = Transaction.objects.get_or_create(
-        reference=payment.reference,
-        defaults={
-            "user": user,
-            "service_type": "wallet_funding",
-            "amount": payment.amount,
-            "status": "success",
-            "provider": "paystack",
-            "provider_reference": payment.reference,
-            "description": "Wallet funding via Paystack",
-            "metadata": {
-                "payment_transaction_id": payment.id,
-                "payment_method": "paystack",
-                "source": "wallet_funding",
+    canonical_tx, created = (
+        Transaction.objects.get_or_create(
+            reference=payment.reference,
+            defaults={
+                "user": user,
+                "service_type":
+                    "wallet_funding",
+                "amount": payment.amount,
+                "status": "success",
+                "provider": "paystack",
+                "provider_reference":
+                    payment.reference,
+                "description":
+                    "Wallet funding via Paystack",
+                "metadata": {
+                    "payment_transaction_id":
+                        payment.id,
+                    "payment_method":
+                        "paystack",
+                    "source":
+                        "wallet_funding",
+                },
             },
-        },
+        )
     )
 
-    # If the row already existed but wasn't marked successful,
-    # normalize it to the successful wallet-funding state.
-    if not created:
-        changed = False
+    if created:
+        return canonical_tx
 
-        if transaction.status != "success":
-            transaction.status = "success"
-            changed = True
+    identity_matches = (
+        canonical_tx.user_id == user.id
+        and canonical_tx.service_type
+        == "wallet_funding"
+        and canonical_tx.amount
+        == payment.amount
+        and canonical_tx.provider
+        == "paystack"
+    )
 
-        if transaction.service_type != "wallet_funding":
-            transaction.service_type = "wallet_funding"
-            changed = True
+    if not identity_matches:
+        raise ValueError(
+            "Conflicting canonical transaction "
+            "for wallet funding reference."
+        )
 
-        if transaction.provider != "paystack":
-            transaction.provider = "paystack"
-            changed = True
+    if (
+        canonical_tx.provider_reference
+        and canonical_tx.provider_reference
+        != payment.reference
+    ):
+        raise ValueError(
+            "Conflicting provider reference "
+            "for wallet funding transaction."
+        )
 
-        if changed:
-            transaction.save(
-                update_fields=[
-                    "status",
-                    "service_type",
-                    "provider",
-                ]
-            )
+    changed_fields = []
 
-    return transaction
+    if canonical_tx.status != "success":
+        canonical_tx.status = "success"
+        changed_fields.append("status")
+
+    if not canonical_tx.provider_reference:
+        canonical_tx.provider_reference = (
+            payment.reference
+        )
+        changed_fields.append(
+            "provider_reference"
+        )
+
+    metadata = canonical_tx.metadata or {}
+
+    expected_payment_id = (
+        metadata.get("payment_transaction_id")
+    )
+
+    if (
+        expected_payment_id is not None
+        and expected_payment_id != payment.id
+    ):
+        raise ValueError(
+            "Conflicting payment transaction "
+            "for wallet funding reference."
+        )
+
+    if expected_payment_id is None:
+        canonical_tx.metadata = {
+            **metadata,
+            "payment_transaction_id":
+                payment.id,
+            "payment_method":
+                "paystack",
+            "source":
+                "wallet_funding",
+        }
+        changed_fields.append("metadata")
+
+    if changed_fields:
+        canonical_tx.save(
+            update_fields=changed_fields
+        )
+
+    return canonical_tx
 
 class InitializePaymentView(APIView):
     permission_classes = [IsAuthenticated]
@@ -213,33 +270,53 @@ class InitializePaymentView(APIView):
         amount = serializer.validated_data["amount"]
         reference = f"NPP-{uuid.uuid4().hex[:16].upper()}"
 
-        # Optional callback URL supplied by the client.
-        # The mobile app uses this to return from Paystack
-        # back into NaijaPayPoint after payment.
         callback_url = (
-            request.data.get("callback_url")
-            or f"{settings.FRONTEND_URL}/payment-success"
+            f"{settings.FRONTEND_URL.rstrip('/')}"
+            "/wallet"
         )
 
-        print(
-            "PAYMENT VIEW CALLBACK:",
-            callback_url,
-        )
+        try:
+            paystack_response = PaystackService.initialize_transaction(
+                email=request.user.email,
+                amount=amount,
+                reference=reference,
+                callback_url=callback_url,
+            )
+        except Exception:
+            logger.error(
+                "Paystack wallet funding initialization failed "
+                "for reference %s.",
+                reference,
+            )
 
-        paystack_response = PaystackService.initialize_transaction(
-            email=request.user.email,
-            amount=amount,
-            reference=reference,
-            callback_url=callback_url,
-        )
-
-        if not paystack_response.get("status"):
             return Response(
                 {
-                    "detail": "Unable to initialize payment",
-                    "provider_response": paystack_response,
+                    "detail": (
+                        "Unable to initialize payment right now. "
+                        "Please try again."
+                    ),
                 },
-                status=status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        if (
+            not isinstance(paystack_response, dict)
+            or paystack_response.get("status") is not True
+        ):
+            logger.warning(
+                "Paystack wallet funding initialization was rejected "
+                "for reference %s.",
+                reference,
+            )
+
+            return Response(
+                {
+                    "detail": (
+                        "Unable to initialize payment right now. "
+                        "Please try again."
+                    ),
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
             )
 
         data = paystack_response.get("data", {})
@@ -300,29 +377,153 @@ class VerifyPaymentView(APIView):
         paystack_response = PaystackService.verify_transaction(reference)
 
         if not paystack_response.get("status"):
+            return Response(
+                {
+                    "detail": (
+                        "Payment verification is "
+                        "temporarily unavailable. "
+                        "Please try again."
+                    )
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        data = paystack_response.get("data", {})
+
+        provider_status = str(
+            data.get("status") or ""
+        ).strip().lower()
+
+        pending_statuses = {
+            "ongoing",
+            "pending",
+            "processing",
+            "queued",
+        }
+
+        if provider_status == "reversed":
+            logger.warning(
+                "Paystack reported reversed status "
+                "for payment %s.",
+                payment.reference,
+            )
+
+            return Response(
+                {
+                    "detail": (
+                        "Payment requires review. "
+                        "No wallet credit was applied."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if provider_status in pending_statuses:
+            return Response(
+                {
+                    "detail": (
+                        "Payment is still being "
+                        "processed. Please try again."
+                    )
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        terminal_failure_statuses = {
+            "failed",
+            "abandoned",
+        }
+
+        if provider_status in terminal_failure_statuses:
             payment.status = "failed"
             payment.save(update_fields=["status"])
 
             return Response(
                 {
-                    "detail": "Payment verification failed",
-                    "provider_response": paystack_response,
+                    "detail":
+                        "Payment was not successful."
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        data = paystack_response.get("data", {})
-
-        if data.get("status") != "success":
-            payment.status = "failed"
-            payment.save(update_fields=["status"])
+        if provider_status != "success":
+            logger.warning(
+                "Paystack returned unknown payment "
+                "status %r for payment %s.",
+                provider_status,
+                payment.reference,
+            )
 
             return Response(
-                {"detail": "Payment was not successful"},
+                {
+                    "detail": (
+                        "Payment status could not be "
+                        "confirmed. Please try again."
+                    )
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        provider_reference = str(
+            data.get("reference") or ""
+        ).strip()
+
+        if provider_reference != payment.reference:
+            return Response(
+                {
+                    "detail": (
+                        "Payment reference "
+                        "verification failed."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        paid_amount = Decimal(data.get("amount", 0)) / Decimal("100")
+        provider_currency = str(
+            data.get("currency") or ""
+        ).strip().upper()
+
+        if provider_currency != "NGN":
+            return Response(
+                {
+                    "detail": (
+                        "Payment currency "
+                        "verification failed."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            paid_amount = (
+                Decimal(str(data.get("amount")))
+                / Decimal("100")
+            )
+        except (
+            InvalidOperation,
+            TypeError,
+            ValueError,
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Payment amount "
+                        "verification failed."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not paid_amount.is_finite():
+            return Response(
+                {
+                    "detail": (
+                        "Payment amount "
+                        "verification failed."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if paid_amount != payment.amount:
             return Response(
@@ -372,9 +573,14 @@ class VerifyPaymentView(APIView):
                 message=f"Your wallet has been credited with ₦{payment.amount}.",
             )
 
-            EmailNotificationService.send_wallet_funded(
-                user=request.user,
-                amount=payment.amount,
+            email_user = request.user
+            email_amount = payment.amount
+
+            transaction.on_commit(
+                lambda: EmailNotificationService.send_wallet_funded(
+                    user=email_user,
+                    amount=email_amount,
+                )
             )
 
             award_referral_bonus_if_eligible(
@@ -490,9 +696,8 @@ class PaystackWebhookView(APIView):
             # Return 200 so Paystack does not repeatedly resend an event
             # that does not belong to a known guest transaction.
             logger.warning(
-                "Refund webhook could not be matched. Event: %s; data: %s",
+                "Refund webhook could not be matched. Event: %s",
                 event,
-                event_data,
             )
 
             return Response(
@@ -511,11 +716,93 @@ class PaystackWebhookView(APIView):
                 .get(pk=guest_transaction.pk)
             )
 
+            # A completed refund is terminal.
+            # Delayed or duplicate events must not reverse it.
+            if guest_transaction.status == "refunded":
+                return Response(
+                    {
+                        "received": True,
+                        "matched": True,
+                        "event": event,
+                        "reference": guest_transaction.reference,
+                        "refund_status": guest_transaction.refund_status,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
             refund_id = (
                 event_data.get("id")
                 or event_data.get("refund_id")
                 or ""
             )
+
+            if (
+                isinstance(refund_id, bool)
+                or not isinstance(refund_id, (str, int))
+                or not str(refund_id).strip()
+            ):
+                logger.warning(
+                    "Rejected Paystack refund webhook "
+                    "with missing or invalid refund ID."
+                )
+
+                return Response(
+                    {
+                        "received": True,
+                        "matched": False,
+                        "detail": "Invalid refund reference.",
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            # Only process refund events for transactions
+            # with an authorized refund already in progress.
+            if not (
+                guest_transaction.status == "refund_pending"
+                or (
+                    guest_transaction.status == "refund_failed"
+                    and event == "refund.processed"
+                    and bool(guest_transaction.refund_reference)
+                    and bool(guest_transaction.refund_amount)
+                )
+            ):
+                logger.warning(
+                    "Rejected refund webhook for unauthorized "
+                    "transaction state: %s",
+                    guest_transaction.reference,
+                )
+
+                return Response(
+                    {
+                        "received": True,
+                        "matched": False,
+                        "detail": "No active authorized refund.",
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            # Reject refund events that do not match
+            # the refund already linked to this transaction.
+            if (
+                guest_transaction.refund_reference
+                and str(refund_id) != str(
+                    guest_transaction.refund_reference
+                )
+            ):
+                logger.warning(
+                    "Rejected mismatched Paystack refund ID "
+                    "for guest transaction %s",
+                    guest_transaction.reference,
+                )
+
+                return Response(
+                    {
+                        "received": True,
+                        "matched": False,
+                        "detail": "Refund reference mismatch.",
+                    },
+                    status=status.HTTP_200_OK,
+                )
 
             provider_refund_status = (
                 event_data.get("status")
@@ -524,13 +811,43 @@ class PaystackWebhookView(APIView):
 
             refund_amount_kobo = event_data.get("amount")
 
-            if refund_amount_kobo is not None:
-                try:
-                    guest_transaction.refund_amount = (
-                        int(refund_amount_kobo) / 100
+            # Require an authorized refund amount and
+            # an exact matching amount from Paystack.
+            expected_refund_amount = (
+                guest_transaction.refund_amount
+            )
+
+            try:
+                valid_amount = (
+                    refund_amount_kobo is not None
+                    and not isinstance(
+                        refund_amount_kobo,
+                        (bool, float),
                     )
-                except (TypeError, ValueError):
-                    pass
+                    and str(refund_amount_kobo).isdigit()
+                    and expected_refund_amount is not None
+                    and expected_refund_amount > 0
+                    and Decimal(str(refund_amount_kobo))
+                    == expected_refund_amount * Decimal("100")
+                )
+            except (ValueError, TypeError, InvalidOperation):
+                valid_amount = False
+
+            if not valid_amount:
+                logger.warning(
+                    "Rejected Paystack refund amount mismatch "
+                    "for guest transaction %s",
+                    guest_transaction.reference,
+                )
+
+                return Response(
+                    {
+                        "received": True,
+                        "matched": False,
+                        "detail": "Refund amount mismatch.",
+                    },
+                    status=status.HTTP_200_OK,
+                )
 
             if refund_id:
                 guest_transaction.refund_reference = str(
@@ -541,7 +858,15 @@ class PaystackWebhookView(APIView):
                 provider_refund_status
             )
 
-            guest_transaction.refund_response = payload
+            # Store only the refund information required
+            # for reconciliation. Never persist the full
+            # Paystack webhook payload or customer details.
+            guest_transaction.refund_response = {
+                "event": str(event),
+                "refund_reference": str(refund_id),
+                "status": str(provider_refund_status),
+                "amount_kobo": int(refund_amount_kobo),
+            }
 
             metadata = guest_transaction.metadata or {}
             webhook_history = metadata.get(
@@ -672,6 +997,26 @@ class PaystackWebhookView(APIView):
                 status=status.HTTP_200_OK,
             )
 
+        provider_currency = str(
+            event_data.get("currency") or ""
+        ).strip().upper()
+
+        if provider_currency != "NGN":
+            logger.warning(
+                "Paystack currency mismatch for %s.",
+                reference,
+            )
+
+            return Response(
+                {
+                    "received": True,
+                    "processed": False,
+                    "reference": reference,
+                    "reason": "currency_mismatch",
+                },
+                status=status.HTTP_200_OK,
+            )
+
         try:
             paid_amount = (
                 Decimal(
@@ -682,6 +1027,23 @@ class PaystackWebhookView(APIView):
         except Exception:
             logger.warning(
                 "Invalid amount in charge.success for %s",
+                reference,
+            )
+
+            return Response(
+                {
+                    "received": True,
+                    "processed": False,
+                    "reference": reference,
+                    "reason": "invalid_amount",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if not paid_amount.is_finite():
+            logger.warning(
+                "Paystack returned an invalid amount "
+                "for %s.",
                 reference,
             )
 
@@ -718,10 +1080,7 @@ class PaystackWebhookView(APIView):
             payment = (
                 PaymentTransaction.objects
                 .select_for_update()
-                .select_related(
-                    "user",
-                    "user__wallet",
-                )
+                .select_related("user")
                 .get(pk=payment.pk)
             )
 
@@ -752,6 +1111,11 @@ class PaystackWebhookView(APIView):
                 description="Wallet funding via Paystack",
             )
 
+            ensure_wallet_funding_transaction(
+                payment,
+                payment.user,
+            )
+
             payment.status = "success"
             payment.verified_at = timezone.now()
 
@@ -777,16 +1141,25 @@ class PaystackWebhookView(APIView):
                 },
             )
 
-            try:
-                EmailNotificationService.send_wallet_funded(
-                    user=payment.user,
-                    amount=payment.amount,
-                )
-            except Exception:
-                logger.exception(
-                    "Wallet funded email failed for %s",
-                    payment.reference,
-                )
+            email_user = payment.user
+            email_amount = payment.amount
+            email_reference = payment.reference
+
+            def send_wallet_funded_email():
+                try:
+                    EmailNotificationService.send_wallet_funded(
+                        user=email_user,
+                        amount=email_amount,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Wallet funded email failed for %s",
+                        email_reference,
+                    )
+
+            database_transaction.on_commit(
+                send_wallet_funded_email
+            )
 
             award_referral_bonus_if_eligible(
                 payment.user

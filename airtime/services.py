@@ -1,6 +1,10 @@
 import requests
 from django.conf import settings
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class VTPassAirtimeService:
     @staticmethod
@@ -22,16 +26,11 @@ class VTPassAirtimeService:
             "phone": phone,
         }
 
-        print("VTPASS AIRTIME PAYLOAD:", payload)
-
         response = requests.post(
             url,
             json=payload,
             headers=cls._headers(),
             timeout=30,
         )
-
-        print("VTPASS STATUS:", response.status_code)
-        print("VTPASS RAW RESPONSE:", response.text)
 
         return response.json()
