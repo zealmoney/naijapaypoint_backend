@@ -3,8 +3,17 @@ from .models import PaymentTransaction
 
 
 class InitializePaymentSerializer(serializers.Serializer):
-    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=100)
+    amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=100,
+    )
 
+    platform = serializers.ChoiceField(
+        choices=["web", "mobile"],
+        default="web",
+        required=False,
+    )
 
 class PaymentTransactionSerializer(serializers.ModelSerializer):
     class Meta:

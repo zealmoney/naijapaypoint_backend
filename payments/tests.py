@@ -26,6 +26,9 @@ from guest_checkout.models import GuestTransaction
 
 from .services import PaystackService
 
+from django.test import override_settings
+from urllib.parse import parse_qs, urlsplit
+
 User = get_user_model()
 
 
@@ -1752,3 +1755,127 @@ class GuestRefundWebhookSecurityTests(TestCase):
             "REFUND-ORDER-001",
         )
         self.assertIsNotNone(transaction.refunded_at)
+
+class WalletFundingCallbackRegressionTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="callback_regression_user",
+            email="callback-regression@example.com",
+            password="test-password-123",
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    @staticmethod
+    def mock_paystack_success():
+        return {
+            "status": True,
+            "data": {
+                "authorization_url":
+                    "https://checkout.example.test/payment",
+            },
+        }
+
+    @patch("payments.views.PaystackService.initialize_transaction")
+    @override_settings(
+        FRONTEND_URL="https://frontend.example.com",
+        BACKEND_PUBLIC_URL="https://backend.example.com",
+    )
+    def test_web_uses_frontend_callback(self, mock_initialize):
+        mock_initialize.return_value = self.mock_paystack_success()
+
+        response = self.client.post(
+            "/api/payments/initialize/",
+            {"amount": "5000.00", "platform": "web"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            mock_initialize.call_args.kwargs["callback_url"],
+            "https://frontend.example.com/wallet",
+        )
+
+    @patch("payments.views.PaystackService.initialize_transaction")
+    @override_settings(
+        FRONTEND_URL="https://frontend.example.com",
+        BACKEND_PUBLIC_URL="https://backend.example.com",
+    )
+    def test_mobile_uses_backend_callback(self, mock_initialize):
+        mock_initialize.return_value = self.mock_paystack_success()
+
+        response = self.client.post(
+            "/api/payments/initialize/",
+            {"amount": "5000.00", "platform": "mobile"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            mock_initialize.call_args.kwargs["callback_url"],
+            "https://backend.example.com/api/payments/mobile-callback/",
+        )
+
+    @patch("payments.views.PaystackService.initialize_transaction")
+    @override_settings(BACKEND_PUBLIC_URL="")
+    def test_mobile_rejects_missing_backend_url(self, mock_initialize):
+        response = self.client.post(
+            "/api/payments/initialize/",
+            {"amount": "5000.00", "platform": "mobile"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 503)
+        mock_initialize.assert_not_called()
+
+    @patch("payments.views.PaystackService.initialize_transaction")
+    @override_settings(BACKEND_PUBLIC_URL="http://backend.example.com")
+    def test_mobile_rejects_insecure_backend_url(self, mock_initialize):
+        response = self.client.post(
+            "/api/payments/initialize/",
+            {"amount": "5000.00", "platform": "mobile"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 503)
+        mock_initialize.assert_not_called()
+
+    @override_settings(
+        ALLOWED_HOSTS=["testserver", "localhost", "127.0.0.1"],
+        SECURE_SSL_REDIRECT=False,
+    )
+    def test_mobile_callback_redirects_with_reference(self):
+        public_client = APIClient()
+
+        response = public_client.get(
+            "/api/payments/mobile-callback/",
+            {"reference": "NPP-TEST-123"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+
+        parsed = urlsplit(response["Location"])
+
+        self.assertEqual(parsed.scheme, "naijapaypointmobile")
+        self.assertEqual(parsed.netloc, "wallet-payment")
+        self.assertEqual(
+            parse_qs(parsed.query).get("reference"),
+            ["NPP-TEST-123"],
+        )
+
+    @override_settings(
+        ALLOWED_HOSTS=["testserver", "localhost", "127.0.0.1"],
+        SECURE_SSL_REDIRECT=False,
+    )
+    def test_mobile_callback_without_reference(self):
+        public_client = APIClient()
+
+        response = public_client.get(
+            "/api/payments/mobile-callback/"
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response["Location"],
+            "naijapaypointmobile://wallet-payment",
+        )

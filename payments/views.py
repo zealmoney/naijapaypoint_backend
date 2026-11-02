@@ -30,11 +30,17 @@ from rest_framework.permissions import AllowAny
 from guest_checkout.models import GuestTransaction
 
 from django.http import HttpResponseRedirect
+
+
+class MobileAppRedirect(HttpResponseRedirect): allowed_schemes = ["http", "https", "naijapaypointmobile"]
+
 from urllib.parse import urlencode
 
 from transactions.models import Transaction
 
 from django.db.models import Sum
+
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -268,12 +274,38 @@ class InitializePaymentView(APIView):
         serializer.is_valid(raise_exception=True)
 
         amount = serializer.validated_data["amount"]
+        platform = serializer.validated_data["platform"]
+
         reference = f"NPP-{uuid.uuid4().hex[:16].upper()}"
 
-        callback_url = (
-            f"{settings.FRONTEND_URL.rstrip('/')}"
-            "/wallet"
-        )
+        if platform == "mobile":
+            backend_url = settings.BACKEND_PUBLIC_URL.strip().rstrip("/")
+            parsed_url = urlsplit(backend_url)
+
+            if (
+                parsed_url.scheme != "https"
+                or not parsed_url.hostname
+                or parsed_url.username is not None
+                or parsed_url.password is not None
+                or parsed_url.port is not None
+                or parsed_url.path not in ("", "/")
+                or parsed_url.query
+                or parsed_url.fragment
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "Mobile payment callback is not configured correctly."
+                        )
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+
+            callback_url = (
+                f"{backend_url}/api/payments/mobile-callback/"
+            )
+        else:
+            callback_url = f"{settings.FRONTEND_URL.rstrip('/')}/wallet"
 
         try:
             paystack_response = PaystackService.initialize_transaction(
@@ -602,12 +634,10 @@ class MobilePaymentCallbackView(APIView):
 
         if not reference:
             deep_link = "naijapaypointmobile://wallet-payment"
-            return HttpResponseRedirect(deep_link)
+            return MobileAppRedirect(deep_link)
 
         query_string = urlencode(
-            {
-                "reference": reference,
-            }
+            {"reference": reference}
         )
 
         deep_link = (
@@ -615,7 +645,7 @@ class MobilePaymentCallbackView(APIView):
             f"?{query_string}"
         )
 
-        return HttpResponseRedirect(deep_link)
+        return MobileAppRedirect(deep_link)
 
 class PaystackWebhookView(APIView):
     authentication_classes = []

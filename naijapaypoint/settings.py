@@ -45,6 +45,11 @@ FRONTEND_URL = config(
     default="http://localhost:3000",
 )
 
+BACKEND_PUBLIC_URL = config(
+    "BACKEND_PUBLIC_URL",
+    default="",
+)
+
 EMAIL_BACKEND = config(
     "EMAIL_BACKEND",
     default="django.core.mail.backends.console.EmailBackend",
