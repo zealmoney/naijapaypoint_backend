@@ -12,6 +12,8 @@ from django.contrib.auth.password_validation import validate_password
 from django.db import IntegrityError, transaction
 from django.db.models import F
 
+from accounts.models import UserSession
+
 from rest_framework_simplejwt.token_blacklist.models import (
     OutstandingToken,
     BlacklistedToken,
@@ -27,6 +29,9 @@ from rest_framework_simplejwt.serializers import (
     TokenRefreshSerializer,
 )
 from rest_framework_simplejwt.exceptions import InvalidToken
+
+from rest_framework_simplejwt.settings import api_settings
+from uuid import UUID
 
 
 def blacklist_user_tokens(user):
@@ -72,7 +77,7 @@ class RegisterSerializer(serializers.ModelSerializer):
             "password_confirm",
             "referral_code",
         ]
-        
+
     def validate_referral_code(self, value):
         code = value.strip().upper()
 
@@ -195,34 +200,102 @@ class RegisterSerializer(serializers.ModelSerializer):
 
         return phone_number
 
+
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     @classmethod
     def get_token(cls, user):
+        # Create an independent session for this login.
+        session = UserSession.objects.create(user=user)
+
+        # Generate the standard SimpleJWT refresh token.
         token = super().get_token(user)
+
+        # Preserve global session revocation.
         token["token_version"] = user.token_version
+
+        # Associate access and refresh tokens with this session.
+        token["sid"] = str(session.id)
+
         return token
 
 class CustomTokenRefreshSerializer(TokenRefreshSerializer):
     def validate(self, attrs):
+        # Parse and validate the incoming refresh token.
         refresh = self.token_class(attrs["refresh"])
 
-        user_id = refresh.get("user_id")
+        user_id = refresh.get(api_settings.USER_ID_CLAIM)
         token_version = refresh.get("token_version")
+        jti = refresh.get(api_settings.JTI_CLAIM)
+        session_id = refresh.get("sid")
 
-        User = get_user_model()
+        # Validate the session UUID before querying the database.
+        if session_id is not None:
+            try:
+                session_id = UUID(session_id)
+            except (ValueError, TypeError, AttributeError):
+                raise InvalidToken(
+                    "Invalid device session."
+                )
 
-        try:
-            user = User.objects.get(pk=user_id)
-        except User.DoesNotExist:
-            raise InvalidToken("Token is no longer valid.")
 
+        # All refresh tokens must identify a valid session.
         if (
-            token_version is None
-            or token_version != user.token_version
+            not user_id
+            or token_version is None
+            or not jti
+            or not session_id
         ):
             raise InvalidToken("Token is no longer valid.")
 
-        return super().validate(attrs)
+        User = get_user_model()
+
+        # Serialize competing refresh requests for the same token.
+        with transaction.atomic():
+            try:
+                outstanding = (
+                    OutstandingToken.objects
+                    .select_for_update()
+                    .get(jti=jti, user_id=user_id)
+                )
+            except OutstandingToken.DoesNotExist:
+                raise InvalidToken("Token is no longer valid.")
+
+            # Recheck blacklist state AFTER acquiring the lock.
+            if BlacklistedToken.objects.filter(
+                token=outstanding
+            ).exists():
+                raise InvalidToken(
+                    "Refresh token has already been used."
+                )
+
+            try:
+                user = User.objects.get(pk=user_id)
+            except User.DoesNotExist:
+                raise InvalidToken("Token is no longer valid.")
+
+            if (
+                not api_settings.USER_AUTHENTICATION_RULE(user)
+                or token_version != user.token_version
+            ):
+                raise InvalidToken("Token is no longer valid.")
+
+            # Lock the session row to coordinate with logout.
+            try:
+                session = (
+                    UserSession.objects
+                    .select_for_update()
+                    .get(pk=session_id, user=user)
+                )
+            except (UserSession.DoesNotExist, ValueError, TypeError):
+                raise InvalidToken("Token is no longer valid.")
+
+            if session.revoked_at is not None:
+                raise InvalidToken(
+                    "Device session has been revoked."
+                )
+
+            # Preserve SimpleJWT's standard rotation behavior.
+            return super().validate(attrs)
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:

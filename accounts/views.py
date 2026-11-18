@@ -27,6 +27,14 @@ from .serializers import (
     blacklist_user_tokens,
 )
 
+from django.db import transaction
+from django.utils import timezone
+from rest_framework_simplejwt.token_blacklist.models import (
+    OutstandingToken,
+    BlacklistedToken,
+)
+from .models import UserSession
+
 
 class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all()
@@ -145,44 +153,36 @@ class RefreshTokenView(TokenRefreshView):
     serializer_class = CustomTokenRefreshSerializer
 
 class LogoutView(APIView):
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        refresh_token = request.data.get("refresh")
+        session_id = request.auth.get("sid")
 
-        if not refresh_token:
+        if not session_id:
             return Response(
-                {"detail": "Refresh token is required."},
-                status=400,
+                {"detail": "Device session identifier is missing."},
+                status=401,
             )
 
-        try:
-            token = RefreshToken(refresh_token)
-            user_id = token.get("user_id")
-
-            if not user_id:
-                return Response(
-                    {"detail": "Invalid refresh token."},
-                    status=400,
-                )
-
-            User = get_user_model()
-
+        with transaction.atomic():
             try:
-                user = User.objects.get(pk=user_id)
-            except User.DoesNotExist:
+                session = (
+                    UserSession.objects
+                    .select_for_update()
+                    .get(
+                        pk=session_id,
+                        user=request.user,
+                    )
+                )
+            except UserSession.DoesNotExist:
                 return Response(
-                    {"detail": "Invalid refresh token."},
-                    status=400,
+                    {"detail": "Device session not found."},
+                    status=401,
                 )
 
-            blacklist_user_tokens(user)
-
-        except TokenError:
-            return Response(
-                {"detail": "Invalid or expired refresh token."},
-                status=400,
-            )
+            if session.revoked_at is None:
+                session.revoked_at = timezone.now()
+                session.save(update_fields=["revoked_at"])
 
         return Response(
             {"detail": "Successfully logged out."},

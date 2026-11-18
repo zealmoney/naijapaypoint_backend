@@ -4,6 +4,9 @@ from django.db.models.functions import Lower
 
 from .utils import normalize_nigerian_phone
 
+import uuid
+from django.conf import settings
+
 
 class User(AbstractUser):
     email = models.EmailField(unique=True)
@@ -50,3 +53,41 @@ class User(AbstractUser):
 
     def __str__(self):
         return self.email
+
+class UserSession(models.Model):
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="auth_sessions",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    revoked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
+    last_used_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["user", "revoked_at"],
+                name="auth_session_user_rev_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Session {self.id} for user {self.user_id}"
